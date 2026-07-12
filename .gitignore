@@ -1,0 +1,21 @@
+# Local credentials and user-specific configuration
+desktop_app/config.json
+desktop_app/google_token.json
+desktop_app/google_sync.json
+desktop_app/google_credentials.json
+
+# Generated and personal application data
+data/
+desktop_app/data/
+
+# Python bytecode and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
