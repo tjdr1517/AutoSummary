@@ -24,7 +24,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QColor, QDrag, QLinearGradient, QPainter
+from PySide6.QtGui import QColor, QDrag, QKeySequence, QLinearGradient, QPainter, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QRadioButton,
@@ -50,6 +51,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTextEdit,
     QTimeEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -1909,31 +1911,16 @@ class MainWindow(QMainWindow):
         hero_top.setSpacing(16)
         hero_layout.addLayout(hero_top)
 
-        title_box = QHBoxLayout()
-        title_box.setSpacing(10)
-        hero_top.addLayout(title_box)
-
-        app_title = QLabel("CoolCalendar")
-        app_title.setObjectName("appTitle")
-        title_box.addWidget(app_title)
-
         self.ai_chip = QLabel("")
-        self.ai_chip.setObjectName("pathChip")
-        title_box.addWidget(self.ai_chip)
+        self.ai_chip.setVisible(False)
 
         hero_top.addStretch(1)
 
         action_box = QHBoxLayout()
-        action_box.setSpacing(10)
+        action_box.setSpacing(8)
         hero_top.addLayout(action_box)
-        action_box.addWidget(self._make_button("새로고침", self._load_all, tooltip="메시지와 일정을 지금 다시 불러옵니다."))
         action_box.addWidget(
-            self._make_button(
-                "화면 맞춤",
-                self.fit_current_windows_to_screen,
-                variant="secondary",
-                tooltip="현재 화면 해상도에 맞게 창 크기를 다시 조정합니다.",
-            )
+            self._make_button("새 일정", self.create_event_for_current_date, tooltip="선택한 날짜에 새 일정을 추가합니다.")
         )
         action_box.addWidget(
             self._make_button(
@@ -1944,38 +1931,34 @@ class MainWindow(QMainWindow):
             )
         )
         action_box.addWidget(
-            self._make_button("AI 설정", self.open_ai_settings, variant="secondary", tooltip="OpenAI 자동 분석/자동 일정 설정을 엽니다.")
-        )
-        action_box.addWidget(
             self._make_button(
-                "Google 연동",
-                self.open_google_calendar_settings,
-                variant="secondary",
-                tooltip="Google Calendar 자동 등록을 설정합니다.",
+                "새로고침", self._load_all, variant="ghost", tooltip="메시지와 일정을 지금 다시 불러옵니다."
             )
-        )
-        action_box.addWidget(
-            self._make_button(
-                "Google 동기화",
-                self.import_google_calendar_events,
-                variant="secondary",
-                tooltip="현재 달 일정을 Google Calendar와 양방향으로 맞춥니다.",
-            )
-        )
-        action_box.addWidget(
-            self._make_button("DB 변경", self.change_db_path, variant="ghost", tooltip="읽어올 CoolMessenger UDB 파일을 변경합니다.")
-        )
-        action_box.addWidget(
-            self._make_button("일정 폴더", self.change_event_dir, variant="ghost", tooltip="일정 파일을 저장할 폴더를 변경합니다.")
-        )
-        action_box.addWidget(
-            self._make_button("폴더 열기", self.open_event_dir, variant="ghost", tooltip="일정 저장 폴더를 탐색기로 엽니다.")
         )
 
-        self.today_tile = StatTile("Today")
-        self.message_tile = StatTile("Messages")
-        self.event_tile = StatTile("Events")
-        self.selection_tile = StatTile("Selection")
+        tools_button = QToolButton()
+        tools_button.setText("설정 및 동기화")
+        tools_button.setProperty("variant", "secondary")
+        tools_button.setPopupMode(QToolButton.InstantPopup)
+        tools_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        tools_button.setToolTip("AI, Google Calendar, 저장 위치와 화면 설정을 엽니다.")
+        tools_menu = QMenu(tools_button)
+        tools_menu.addAction("AI 설정", self.open_ai_settings)
+        tools_menu.addAction("Google Calendar 설정", self.open_google_calendar_settings)
+        tools_menu.addAction("Google Calendar 동기화", self.import_google_calendar_events)
+        tools_menu.addSeparator()
+        tools_menu.addAction("DB 변경", self.change_db_path)
+        tools_menu.addAction("일정 폴더 변경", self.change_event_dir)
+        tools_menu.addAction("일정 폴더 열기", self.open_event_dir)
+        tools_menu.addSeparator()
+        tools_menu.addAction("화면 맞춤", self.fit_current_windows_to_screen)
+        tools_button.setMenu(tools_menu)
+        action_box.addWidget(tools_button)
+
+        self.today_tile = StatTile("오늘")
+        self.message_tile = StatTile("메시지")
+        self.event_tile = StatTile("일정")
+        self.selection_tile = StatTile("선택한 날짜")
 
         self.db_chip = QLabel("")
         self.db_chip.setObjectName("statusChip")
@@ -2009,13 +1992,13 @@ class MainWindow(QMainWindow):
         self.message_list.itemDoubleClicked.connect(lambda *_args: self.add_selected_message_to_current_date())
         left_layout.addWidget(self.message_list, 5)
 
-        self.add_selected_btn = self._make_button("선택 메시지를 현재 날짜에 추가", self.add_selected_message_to_current_date)
+        self.add_selected_btn = self._make_button("선택 메시지 일정 추가", self.add_selected_message_to_current_date)
         self.add_selected_btn.setEnabled(False)
         action_row = QHBoxLayout()
         action_row.setSpacing(10)
         action_row.addWidget(self.add_selected_btn, 1)
 
-        self.ai_analyze_btn = self._make_button("선택 메시지 AI 분석", self.analyze_selected_message, variant="secondary")
+        self.ai_analyze_btn = self._make_button("AI 분석", self.analyze_selected_message, variant="secondary", tooltip="선택한 메시지에서 일정과 할 일을 분석합니다.")
         self.ai_analyze_btn.setEnabled(False)
         action_row.addWidget(self.ai_analyze_btn, 1)
         left_layout.addLayout(action_row)
@@ -2033,8 +2016,6 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(16, 16, 16, 16)
         right_layout.setSpacing(10)
-        right_layout.addWidget(self._section_title("월간 일정 보드", "유리질감 월간 보드에 메시지를 드래그하거나 버튼으로 바로 일정을 추가하세요."))
-
         self.board_shell = QFrame()
         self.board_shell.setObjectName("boardShell")
         board_shell_layout = QVBoxLayout(self.board_shell)
@@ -2042,6 +2023,8 @@ class MainWindow(QMainWindow):
         board_shell_layout.setSpacing(0)
         self.board = CalendarBoardWidget("메인 보드")
         self.board.setObjectName("mainBoard")
+        self.board.title_label.setVisible(False)
+        self.board.tip_label.setVisible(False)
         self.board.date_selected.connect(self.on_date_selected)
         self.board.message_dropped.connect(self.on_message_dropped)
         self.board.day_open_requested.connect(self.open_day_manager)
@@ -2098,6 +2081,13 @@ class MainWindow(QMainWindow):
         status.addPermanentWidget(self.dir_chip)
         status.showMessage("준비됨")
 
+        search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        search_shortcut.activated.connect(self.message_search.setFocus)
+        new_event_shortcut = QShortcut(QKeySequence("Ctrl+N"), self)
+        new_event_shortcut.activated.connect(self.create_event_for_current_date)
+        refresh_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        refresh_shortcut.activated.connect(self._load_all)
+
     def _make_button(self, text: str, slot, *, variant: str = "primary", tooltip: str = "") -> QPushButton:
         button = QPushButton(text)
         button.setProperty("variant", variant)
@@ -2115,6 +2105,11 @@ class MainWindow(QMainWindow):
         title_label = QLabel(title)
         title_label.setObjectName("sectionTitle")
         layout.addWidget(title_label)
+
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("sectionSubtitle")
+        subtitle_label.setWordWrap(True)
+        layout.addWidget(subtitle_label)
 
         return box
 
@@ -2328,7 +2323,7 @@ class MainWindow(QMainWindow):
                 color: #ffd874;
                 border-color: rgba(255, 216, 116, 0.45);
             }
-            QPushButton {
+            QPushButton, QToolButton {
                 background: rgba(235, 167, 87, 0.96);
                 color: #112338;
                 border: none;
@@ -2336,22 +2331,23 @@ class MainWindow(QMainWindow):
                 padding: 9px 14px;
                 font-weight: 700;
             }
-            QPushButton:hover {
+            QPushButton:hover, QToolButton:hover {
                 background: rgba(247, 190, 104, 1.0);
             }
-            QPushButton:disabled {
+            QPushButton:disabled, QToolButton:disabled {
                 background: rgba(120, 132, 146, 0.45);
                 color: rgba(240, 246, 251, 0.55);
             }
-            QPushButton[variant="secondary"] {
+            QPushButton[variant="secondary"], QToolButton[variant="secondary"] {
                 background: rgba(166, 226, 255, 0.16);
                 color: #dff4ff;
                 border: 1px solid rgba(165, 226, 255, 0.28);
             }
-            QPushButton[variant="secondary"]:hover, QPushButton[variant="ghost"]:hover {
+            QPushButton[variant="secondary"]:hover, QToolButton[variant="secondary"]:hover,
+            QPushButton[variant="ghost"]:hover, QToolButton[variant="ghost"]:hover {
                 background: rgba(166, 226, 255, 0.24);
             }
-            QPushButton[variant="ghost"] {
+            QPushButton[variant="ghost"], QToolButton[variant="ghost"] {
                 background: rgba(255, 255, 255, 0.07);
                 color: #d5ebfb;
                 border: 1px solid rgba(255, 255, 255, 0.10);
@@ -2623,7 +2619,7 @@ class MainWindow(QMainWindow):
                 color: #b27800;
                 border-color: #ffe4a3;
             }
-            QWidget#rootSurface QPushButton {
+            QWidget#rootSurface QPushButton, QWidget#rootSurface QToolButton {
                 background: #3182f6;
                 color: #ffffff;
                 border: none;
@@ -2631,27 +2627,31 @@ class MainWindow(QMainWindow):
                 padding: 8px 13px;
                 font-weight: 800;
             }
-            QWidget#rootSurface QPushButton:hover {
+            QWidget#rootSurface QPushButton:hover, QWidget#rootSurface QToolButton:hover {
                 background: #1b64da;
             }
-            QWidget#rootSurface QPushButton:disabled {
+            QWidget#rootSurface QPushButton:disabled, QWidget#rootSurface QToolButton:disabled {
                 background: #e5e8eb;
                 color: #a5adba;
             }
-            QWidget#rootSurface QPushButton[variant="secondary"] {
+            QWidget#rootSurface QPushButton[variant="secondary"],
+            QWidget#rootSurface QToolButton[variant="secondary"] {
                 background: #eef6ff;
                 color: #1769e0;
                 border: 1px solid #d6e8ff;
             }
-            QWidget#rootSurface QPushButton[variant="secondary"]:hover {
+            QWidget#rootSurface QPushButton[variant="secondary"]:hover,
+            QWidget#rootSurface QToolButton[variant="secondary"]:hover {
                 background: #e3f0ff;
             }
-            QWidget#rootSurface QPushButton[variant="ghost"] {
+            QWidget#rootSurface QPushButton[variant="ghost"],
+            QWidget#rootSurface QToolButton[variant="ghost"] {
                 background: #f2f4f6;
                 color: #4e5968;
                 border: 1px solid #e5e8eb;
             }
-            QWidget#rootSurface QPushButton[variant="ghost"]:hover {
+            QWidget#rootSurface QPushButton[variant="ghost"]:hover,
+            QWidget#rootSurface QToolButton[variant="ghost"]:hover {
                 background: #e9edf2;
             }
             QWidget#rootSurface QPushButton[variant="danger"] {
@@ -2733,6 +2733,26 @@ class MainWindow(QMainWindow):
             }
             QStatusBar::item {
                 border: none;
+            }
+            QMenu {
+                background: #ffffff;
+                color: #333d4b;
+                border: 1px solid #dfe5ec;
+                border-radius: 12px;
+                padding: 6px;
+            }
+            QMenu::item {
+                border-radius: 8px;
+                padding: 8px 28px 8px 12px;
+            }
+            QMenu::item:selected {
+                background: #eaf3ff;
+                color: #1769e0;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #edf1f5;
+                margin: 5px 8px;
             }
             QLabel#statusChip {
                 background: #f2f4f6;
@@ -3853,4 +3873,3 @@ class MainWindow(QMainWindow):
         if self.ai_worker is not None:
             self.ai_worker.wait(1200)
         super().closeEvent(event)
-
