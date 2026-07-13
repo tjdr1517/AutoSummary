@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 from coolcalendar.models import CalendarEvent, Message
+from coolcalendar.services.event_state import clear_event_completion, move_event_completion
 from coolcalendar.services.messages import build_event_description, guess_event_time
 
 
@@ -175,6 +176,7 @@ def update_event(
     )
     if target_path != file_path and file_path.exists():
         file_path.unlink()
+        move_event_completion(file_path, target_path)
     return target_path
 
 
@@ -210,6 +212,7 @@ def create_event_from_message(
 def delete_event(file_path: Path) -> bool:
     try:
         file_path.unlink()
+        clear_event_completion(file_path)
         return True
     except FileNotFoundError:
         return False

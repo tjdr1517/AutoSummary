@@ -33,6 +33,7 @@ class CalendarEvent:
     all_day: bool = False
     end_date: dt.date | None = None
     end_time_text: str = ""
+    completed: bool = False
 
 
 @dataclass(slots=True)

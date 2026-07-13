@@ -5,7 +5,7 @@ import datetime as dt
 import json
 import os
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from html import escape as html_escape
 from pathlib import Path
 
@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QSizeGrip,
     QSizePolicy,
     QSlider,
     QSplitter,
@@ -73,6 +74,7 @@ from coolcalendar.services.desktop import (
     set_window_screen_bounds,
     window_screen_bounds,
 )
+from coolcalendar.services.event_state import event_key, load_completed_event_keys, set_event_completed
 from coolcalendar.services.events import create_event, create_event_from_message, delete_event, load_events, update_event
 from coolcalendar.services.google_calendar import (
     GoogleCalendarSyncError,
@@ -419,6 +421,7 @@ class MessageCardWidget(QFrame):
         super().__init__()
         self.setObjectName("messageCard")
         self.setProperty("selected", False)
+        self.setProperty("dragging", False)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
         suggested_date = guess_event_date(message)
@@ -473,6 +476,7 @@ class EventCardWidget(QFrame):
         super().__init__()
         self.setObjectName("eventCard")
         self.setProperty("selected", False)
+        self.setProperty("completed", event.completed)
 
         description = shorten_text(event.description.replace("\n", " "), 88)
         time_text = event.time_text or "종일"
@@ -489,7 +493,7 @@ class EventCardWidget(QFrame):
         self.time_label.setObjectName("timeBadge")
         top.addWidget(self.time_label)
 
-        self.title_label = QLabel(event.title)
+        self.title_label = QLabel(f"✓ {event.title}" if event.completed else event.title)
         self.title_label.setObjectName("cardTitle")
         self.title_label.setWordWrap(True)
         top.addWidget(self.title_label, 1)
@@ -1328,7 +1332,23 @@ class MessageListWidget(QListWidget):
             return
         drag = QDrag(self)
         drag.setMimeData(self.mimeData([item]))
-        drag.exec(Qt.CopyAction)
+        card = self.itemWidget(item)
+        if isinstance(card, MessageCardWidget):
+            card.setProperty("dragging", True)
+            card.style().unpolish(card)
+            card.style().polish(card)
+            preview = card.grab()
+            if preview.width() > 340:
+                preview = preview.scaledToWidth(340, Qt.SmoothTransformation)
+            drag.setPixmap(preview)
+            drag.setHotSpot(QPoint(min(28, preview.width() // 2), min(24, preview.height() // 2)))
+        try:
+            drag.exec(Qt.CopyAction)
+        finally:
+            if isinstance(card, MessageCardWidget):
+                card.setProperty("dragging", False)
+                card.style().unpolish(card)
+                card.style().polish(card)
 
 
 class EventListWidget(QListWidget):
@@ -1347,6 +1367,82 @@ class EventListWidget(QListWidget):
         super().keyPressEvent(event)
 
 
+class EventTodoRowWidget(QFrame):
+    def __init__(
+        self,
+        event: CalendarEvent,
+        *,
+        on_toggle: Callable[[Path, bool], None],
+    ) -> None:
+        super().__init__()
+        self.setObjectName("eventTodoRow")
+        self.setProperty("completed", event.completed)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 8, 10, 8)
+        layout.setSpacing(8)
+
+        check = QCheckBox(event.title)
+        check.setObjectName("eventTodoCheck")
+        check.setChecked(event.completed)
+        font = check.font()
+        font.setStrikeOut(event.completed)
+        check.setFont(font)
+        check.toggled.connect(lambda completed: on_toggle(event.file_path, completed))
+        layout.addWidget(check, 1)
+
+        time_label = QLabel(event.time_text or "종일")
+        time_label.setObjectName("softChip")
+        layout.addWidget(time_label)
+
+        if event.completed:
+            done_label = QLabel("완료")
+            done_label.setObjectName("eventDoneLabel")
+            layout.addWidget(done_label)
+
+
+class EventTodoDialog(ChromeDialog):
+    def __init__(
+        self,
+        event_date: dt.date,
+        *,
+        event_provider: Callable[[dt.date], list[CalendarEvent]],
+        on_toggle: Callable[[Path, bool], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(f"{event_date.strftime('%Y.%m.%d')} 일정", "등록된 일정을 체크리스트처럼 관리합니다.", parent=parent)
+        self.event_date = event_date
+        self.event_provider = event_provider
+        self.on_toggle = on_toggle
+        self.resize(540, 620)
+        self.set_meta_text(event_date.strftime("%Y-%m-%d"))
+
+        self.event_list = QListWidget()
+        self.event_list.setObjectName("eventTodoList")
+        self.event_list.setSpacing(7)
+        self.body_layout.addWidget(self.event_list, 1)
+
+        close_button = QPushButton("닫기")
+        close_button.setProperty("variant", "ghost")
+        close_button.setFixedHeight(42)
+        close_button.clicked.connect(self.accept)
+        self.body_layout.addWidget(close_button, 0, Qt.AlignRight)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.event_list.clear()
+        for event in self.event_provider(self.event_date):
+            item = QListWidgetItem()
+            row = EventTodoRowWidget(event, on_toggle=self._toggle_event)
+            item.setSizeHint(QSize(0, max(48, row.sizeHint().height() + 4)))
+            self.event_list.addItem(item)
+            self.event_list.setItemWidget(item, row)
+
+    def _toggle_event(self, event_path: Path, completed: bool) -> None:
+        self.on_toggle(event_path, completed)
+        self._refresh()
+
+
 class DayCell(QFrame):
     selected = Signal(object)
     message_dropped = Signal(object, int)
@@ -1358,6 +1454,7 @@ class DayCell(QFrame):
         self.setAcceptDrops(True)
         self.setObjectName("dayCell")
         self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_Hover, True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         layout = QVBoxLayout(self)
@@ -1385,6 +1482,20 @@ class DayCell(QFrame):
         self.events_label.setTextFormat(Qt.RichText)
         self.events_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(self.events_label, 1)
+
+        self.drop_hint = QLabel("여기에 놓기")
+        self.drop_hint.setObjectName("dropHint")
+        self.drop_hint.setAlignment(Qt.AlignCenter)
+        self.drop_hint.setVisible(False)
+        layout.addWidget(self.drop_hint)
+
+    def _set_drop_target(self, active: bool) -> None:
+        if self.property("dropTarget") == active:
+            return
+        self.setProperty("dropTarget", active)
+        self.drop_hint.setVisible(active)
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def set_payload(
         self,
@@ -1439,15 +1550,22 @@ class DayCell(QFrame):
 
     def dragEnterEvent(self, event) -> None:  # type: ignore[override]
         if event.mimeData().hasFormat(MessageListWidget.mime_type):
+            self._set_drop_target(True)
             event.acceptProposedAction()
         else:
             event.ignore()
 
+    def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+        self._set_drop_target(False)
+        event.accept()
+
     def dropEvent(self, event) -> None:  # type: ignore[override]
         if self.date is None:
+            self._set_drop_target(False)
             event.ignore()
             return
         raw = bytes(event.mimeData().data(MessageListWidget.mime_type)).decode("utf-8")
+        self._set_drop_target(False)
         self.message_dropped.emit(self.date, int(raw))
         event.acceptProposedAction()
 
@@ -1489,20 +1607,23 @@ class CalendarBoardWidget(QWidget):
         self.tip_label.setObjectName("boardTip")
         title_box.addWidget(self.tip_label)
 
-        prev_btn = QPushButton("이전")
-        prev_btn.setProperty("variant", "ghost")
-        prev_btn.clicked.connect(self.prev_month)
-        header.addWidget(prev_btn)
+        navigation = QFrame()
+        navigation.setObjectName("calendarNav")
+        navigation_layout = QHBoxLayout(navigation)
+        navigation_layout.setContentsMargins(3, 3, 3, 3)
+        navigation_layout.setSpacing(2)
 
-        today_btn = QPushButton("오늘")
-        today_btn.setProperty("variant", "ghost")
-        today_btn.clicked.connect(self.go_today)
-        header.addWidget(today_btn)
-
-        next_btn = QPushButton("다음")
-        next_btn.setProperty("variant", "ghost")
-        next_btn.clicked.connect(self.next_month)
-        header.addWidget(next_btn)
+        for text, slot, segment in (
+            ("이전", self.prev_month, "start"),
+            ("오늘", self.go_today, "middle"),
+            ("다음", self.next_month, "end"),
+        ):
+            button = QPushButton(text)
+            button.setObjectName("calendarNavButton")
+            button.setProperty("segment", segment)
+            button.clicked.connect(slot)
+            navigation_layout.addWidget(button)
+        header.addWidget(navigation)
 
         weekday_row = QHBoxLayout()
         weekday_row.setSpacing(7)
@@ -1589,12 +1710,12 @@ class CalendarBoardWidget(QWidget):
         lines: list[str] = []
         if is_main_surface:
             for event in events[:1]:
-                badge_color = "#1769e0" if event.all_day else "#0891b2"
+                badge_color = "#8a98a8" if event.completed else ("#1769e0" if event.all_day else "#0891b2")
                 title = html_escape(shorten_text(event.title, 18))
                 lines.append(
                     "<div style='line-height:1.05;'>"
-                    f"<span style='color:{badge_color}; font-size:11pt; font-weight:800;'>●</span> "
-                    f"<span style='color:#191f28; font-size:8.5pt;'>{title}</span>"
+                    f"<span style='color:{badge_color}; font-size:10pt; font-weight:800;'>{'✓' if event.completed else '●'}</span> "
+                    f"<span style='color:{'#7c8794' if event.completed else '#191f28'}; font-size:8.5pt;'>{title}</span>"
                     "</div>"
                 )
             if len(events) > 1:
@@ -1609,12 +1730,12 @@ class CalendarBoardWidget(QWidget):
         title_size = f"{10.5 * scale:.1f}pt"
         more_size = f"{9 * scale:.1f}pt"
         for event in events[:2]:
-            badge_color = palette["ev_allday"] if event.all_day else palette["ev_timed"]
+            badge_color = palette["ev_more"] if event.completed else (palette["ev_allday"] if event.all_day else palette["ev_timed"])
             time_label = "종일" if event.all_day else event.time_text
             title = html_escape(shorten_text(event.title, 14))
             lines.append(
                 "<div style='margin-bottom:3px; line-height:1.15;'>"
-                f"<span style='color:{badge_color}; font-size:{time_size}; font-weight:700;'>{html_escape(time_label)}</span>&nbsp;"
+                f"<span style='color:{badge_color}; font-size:{time_size}; font-weight:700;'>{'✓' if event.completed else html_escape(time_label)}</span>&nbsp;"
                 f"<span style='color:{palette['ev_title']}; font-size:{title_size}; font-weight:600;'>{title}</span>"
                 "</div>"
             )
@@ -1665,6 +1786,7 @@ class OverlayBoardWindow(QWidget):
     closed = Signal()
     message_dropped = Signal(object, int)
     manage_requested = Signal(object)
+    todo_requested = Signal(object)
     settings_requested = Signal()
 
     def __init__(self) -> None:
@@ -1672,6 +1794,7 @@ class OverlayBoardWindow(QWidget):
         self.setWindowTitle("CoolCalendar Overlay")
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setMinimumSize(760, 500)
         self.resize(1080, 720)
         self._drag_offset = QPoint()
         self._drag_start_top_left = QPoint()
@@ -1680,7 +1803,7 @@ class OverlayBoardWindow(QWidget):
         self._desktop_attached = False
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(24, 24, 24, 24)
+        outer.setContentsMargins(20, 20, 20, 20)
         outer.setSpacing(0)
 
         shell = QFrame()
@@ -1689,11 +1812,13 @@ class OverlayBoardWindow(QWidget):
         outer.addWidget(shell)
 
         root = QVBoxLayout(shell)
-        root.setContentsMargins(18, 18, 18, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(10)
 
         chrome = QFrame()
         chrome.setObjectName("overlayChrome")
+        chrome.setCursor(Qt.OpenHandCursor)
+        self.chrome = chrome
         chrome_layout = QHBoxLayout(chrome)
         chrome_layout.setContentsMargins(16, 14, 16, 14)
         chrome_layout.setSpacing(10)
@@ -1713,6 +1838,11 @@ class OverlayBoardWindow(QWidget):
         manage_btn.clicked.connect(self._emit_manage_requested)
         chrome_layout.addWidget(manage_btn)
 
+        todo_btn = QPushButton("일정 체크")
+        todo_btn.setProperty("variant", "secondary")
+        todo_btn.clicked.connect(self._emit_todo_requested)
+        chrome_layout.addWidget(todo_btn)
+
         settings_btn = QPushButton("보드 설정")
         settings_btn.setProperty("variant", "ghost")
         settings_btn.setToolTip("테마 색, 배경 투명도, 글자 크기를 조절합니다.")
@@ -1731,8 +1861,13 @@ class OverlayBoardWindow(QWidget):
         self.board.day_open_requested.connect(self._emit_manage_requested)
         root.addWidget(self.board, 1)
 
+        resize_grip = QSizeGrip(shell)
+        resize_grip.setToolTip("드래그하여 위젯 크기 조절")
+        root.addWidget(resize_grip, 0, Qt.AlignRight)
+
         chrome.mousePressEvent = self._start_drag  # type: ignore[method-assign]
         chrome.mouseMoveEvent = self._move_drag  # type: ignore[method-assign]
+        chrome.mouseReleaseEvent = self._end_drag  # type: ignore[method-assign]
         self.set_selected_date(self.selected_date)
 
     def changeEvent(self, event) -> None:  # type: ignore[override]
@@ -1755,6 +1890,7 @@ class OverlayBoardWindow(QWidget):
         if event.button() == Qt.LeftButton:
             self._drag_offset = event.globalPosition().toPoint()
             self._drag_start_top_left = self.screen_geometry().topLeft()
+            self.chrome.setCursor(Qt.ClosedHandCursor)
             event.accept()
 
     def _move_drag(self, event) -> None:
@@ -1764,6 +1900,10 @@ class OverlayBoardWindow(QWidget):
             target.moveTopLeft(self._drag_start_top_left + delta)
             self.apply_screen_geometry(target)
             event.accept()
+
+    def _end_drag(self, event) -> None:
+        self.chrome.setCursor(Qt.OpenHandCursor)
+        event.accept()
 
     def is_desktop_attached(self) -> bool:
         return self._desktop_attached
@@ -1802,8 +1942,9 @@ class OverlayBoardWindow(QWidget):
     def set_selected_date(self, date: dt.date, *, preferred_path: Path | None = None) -> None:
         self.selected_date = date
         self.board.set_selected_date(date)
-        event_count = len(self.events_by_date.get(self.selected_date, []))
-        self.overlay_date_chip.setText(f"{self.selected_date.strftime('%Y-%m-%d')} · 일정 {event_count}건")
+        events = self.events_by_date.get(self.selected_date, [])
+        unfinished_count = sum(not event.completed for event in events)
+        self.overlay_date_chip.setText(f"{self.selected_date.strftime('%Y-%m-%d')} · 일정 {len(events)}건 · 미완료 {unfinished_count}건")
 
     def _on_date_selected(self, date: dt.date) -> None:
         self.selected_date = date
@@ -1811,6 +1952,9 @@ class OverlayBoardWindow(QWidget):
 
     def _emit_manage_requested(self, date: dt.date | None = None) -> None:
         self.manage_requested.emit(date or self.selected_date)
+
+    def _emit_todo_requested(self) -> None:
+        self.todo_requested.emit(self.selected_date)
 
     def attach_to_desktop_layer(self) -> None:
         if self._desktop_attached:
@@ -1898,13 +2042,14 @@ class MainWindow(QMainWindow):
         central.setObjectName("rootSurface")
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 14)
+        layout.setSpacing(12)
 
         self.hero = QFrame()
         self.hero.setObjectName("topToolbar")
+        apply_shadow(self.hero, blur=22, alpha=18, y_offset=5)
         hero_layout = QVBoxLayout(self.hero)
-        hero_layout.setContentsMargins(0, 0, 0, 0)
+        hero_layout.setContentsMargins(12, 10, 12, 10)
         hero_layout.setSpacing(0)
 
         hero_top = QHBoxLayout()
@@ -2036,13 +2181,18 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(event_toolbar)
 
         self.selected_date_label = QLabel("")
-        self.selected_date_label.setObjectName("sectionTitle")
+        self.selected_date_label.setObjectName("selectionLabel")
         event_toolbar.addWidget(self.selected_date_label, 1)
 
         self.new_event_btn = self._make_button(
             "새 일정", self.create_event_for_current_date, variant="secondary", tooltip="선택한 날짜에 새 일정을 추가합니다."
         )
         event_toolbar.addWidget(self.new_event_btn)
+
+        self.event_todo_btn = self._make_button(
+            "일정 체크", self.open_event_todo_for_current_date, variant="secondary", tooltip="선택한 날짜의 등록 일정을 체크리스트로 엽니다."
+        )
+        event_toolbar.addWidget(self.event_todo_btn)
 
         self.edit_event_btn = self._make_button("수정", self.edit_current_event, variant="ghost", tooltip="선택한 일정을 수정합니다.")
         self.edit_event_btn.setEnabled(False)
@@ -2280,6 +2430,33 @@ class MainWindow(QMainWindow):
                 padding: 0px;
                 margin: 0px;
             }
+            QListWidget#eventTodoList {
+                background: transparent;
+                border: none;
+            }
+            QFrame#dialogShell QFrame#eventTodoRow {
+                background: rgba(255, 255, 255, 0.06);
+                border: 1px solid rgba(189, 227, 247, 0.14);
+                border-radius: 14px;
+            }
+            QFrame#dialogShell QFrame#eventTodoRow[completed="true"] {
+                background: rgba(255, 255, 255, 0.035);
+                border-color: rgba(189, 227, 247, 0.08);
+            }
+            QFrame#dialogShell QCheckBox#eventTodoCheck {
+                color: #f3f9fd;
+                spacing: 10px;
+                font-size: 10.5pt;
+                font-weight: 600;
+            }
+            QFrame#dialogShell QFrame#eventTodoRow[completed="true"] QCheckBox#eventTodoCheck {
+                color: #8da9bd;
+            }
+            QFrame#dialogShell QLabel#eventDoneLabel {
+                color: #9bcbb3;
+                font-size: 8.5pt;
+                font-weight: 700;
+            }
             QTextEdit#detailPane {
                 background: rgba(7, 20, 33, 0.72);
                 border: 1px solid rgba(173, 215, 242, 0.14);
@@ -2388,6 +2565,19 @@ class MainWindow(QMainWindow):
             DayCell[class~="cellSelected"] {
                 background: rgba(97, 178, 244, 0.22);
                 border: 1px solid rgba(179, 230, 255, 0.95);
+            }
+            DayCell[dropTarget="true"] {
+                background: rgba(96, 185, 255, 0.26);
+                border: 2px solid rgba(202, 241, 255, 0.96);
+            }
+            DayCell QLabel#dropHint {
+                background: rgba(9, 28, 45, 0.64);
+                border: 1px solid rgba(192, 233, 255, 0.48);
+                border-radius: 9px;
+                color: #e9f8ff;
+                font-size: 8.5pt;
+                font-weight: 700;
+                padding: 4px 7px;
             }
             QLabel#dayLabel {
                 background: transparent;
@@ -2505,19 +2695,20 @@ class MainWindow(QMainWindow):
         """
         stylesheet += """
             QWidget#rootSurface {
-                color: #191f28;
-                font-family: "Malgun Gothic", "Segoe UI";
+                color: #1c1c1e;
+                font-family: "Segoe UI Variable", "Malgun Gothic", "Segoe UI";
             }
             QWidget#rootSurface QFrame#heroCard,
             QWidget#rootSurface QFrame#panel,
             QWidget#rootSurface QFrame#boardShell {
-                background: rgba(255, 255, 255, 0.94);
-                border: 1px solid rgba(217, 224, 232, 0.96);
-                border-radius: 22px;
+                background: rgba(255, 255, 255, 0.96);
+                border: 1px solid rgba(60, 60, 67, 0.12);
+                border-radius: 18px;
             }
             QWidget#rootSurface QFrame#topToolbar {
-                background: transparent;
-                border: none;
+                background: rgba(255, 255, 255, 0.84);
+                border: 1px solid rgba(255, 255, 255, 0.82);
+                border-radius: 16px;
             }
             QWidget#rootSurface QFrame#heroCard {
                 background: rgba(255, 255, 255, 0.98);
@@ -2545,9 +2736,14 @@ class MainWindow(QMainWindow):
             }
             QWidget#rootSurface QLabel#sectionTitle,
             QWidget#rootSurface QLabel#boardTitle {
-                color: #191f28;
-                font-size: 14pt;
-                font-weight: 800;
+                color: #1c1c1e;
+                font-size: 13pt;
+                font-weight: 700;
+            }
+            QWidget#rootSurface QLabel#selectionLabel {
+                color: #1c1c1e;
+                font-size: 11pt;
+                font-weight: 700;
             }
             QWidget#rootSurface QFrame#statTile {
                 background: #f7f9fb;
@@ -2572,23 +2768,36 @@ class MainWindow(QMainWindow):
                 padding: 9px 12px;
             }
             QWidget#rootSurface QTextEdit#detailPane {
-                background: #ffffff;
-                border: 1px solid #e5e8eb;
-                border-radius: 18px;
-                color: #191f28;
+                background: #f7f7fa;
+                border: 1px solid rgba(60, 60, 67, 0.10);
+                border-radius: 14px;
+                color: #1c1c1e;
                 padding: 13px;
-                selection-background-color: rgba(49, 130, 246, 0.18);
+                selection-background-color: rgba(0, 122, 255, 0.20);
             }
             QWidget#rootSurface QFrame#messageCard,
             QWidget#rootSurface QFrame#eventCard {
                 background: #ffffff;
-                border: 1px solid #e5e8eb;
-                border-radius: 14px;
+                border: 1px solid rgba(60, 60, 67, 0.12);
+                border-radius: 13px;
             }
             QWidget#rootSurface QFrame#messageCard[selected="true"],
             QWidget#rootSurface QFrame#eventCard[selected="true"] {
-                background: #f2f7ff;
-                border: 1px solid rgba(49, 130, 246, 0.45);
+                background: #eaf3ff;
+                border: 1px solid rgba(0, 122, 255, 0.52);
+            }
+            QWidget#rootSurface QFrame#messageCard[dragging="true"] {
+                background: #eaf3ff;
+                border: 2px solid #007aff;
+            }
+            QWidget#rootSurface QFrame#eventCard[completed="true"] {
+                background: #f7f7fa;
+                border-color: rgba(60, 60, 67, 0.08);
+            }
+            QWidget#rootSurface QFrame#eventCard[completed="true"] QLabel#cardTitle,
+            QWidget#rootSurface QFrame#eventCard[completed="true"] QLabel#cardBody,
+            QWidget#rootSurface QFrame#eventCard[completed="true"] QLabel#cardSubBody {
+                color: #8e8e93;
             }
             QWidget#rootSurface QLabel#cardTitle {
                 color: #191f28;
@@ -2620,15 +2829,18 @@ class MainWindow(QMainWindow):
                 border-color: #ffe4a3;
             }
             QWidget#rootSurface QPushButton, QWidget#rootSurface QToolButton {
-                background: #3182f6;
+                background: #007aff;
                 color: #ffffff;
                 border: none;
-                border-radius: 11px;
+                border-radius: 10px;
                 padding: 8px 13px;
-                font-weight: 800;
+                font-weight: 700;
             }
             QWidget#rootSurface QPushButton:hover, QWidget#rootSurface QToolButton:hover {
-                background: #1b64da;
+                background: #0069dd;
+            }
+            QWidget#rootSurface QPushButton:pressed, QWidget#rootSurface QToolButton:pressed {
+                background: #0058b8;
             }
             QWidget#rootSurface QPushButton:disabled, QWidget#rootSurface QToolButton:disabled {
                 background: #e5e8eb;
@@ -2636,60 +2848,100 @@ class MainWindow(QMainWindow):
             }
             QWidget#rootSurface QPushButton[variant="secondary"],
             QWidget#rootSurface QToolButton[variant="secondary"] {
-                background: #eef6ff;
-                color: #1769e0;
-                border: 1px solid #d6e8ff;
+                background: #eaf3ff;
+                color: #007aff;
+                border: 1px solid rgba(0, 122, 255, 0.16);
             }
             QWidget#rootSurface QPushButton[variant="secondary"]:hover,
             QWidget#rootSurface QToolButton[variant="secondary"]:hover {
-                background: #e3f0ff;
+                background: #dcecff;
             }
             QWidget#rootSurface QPushButton[variant="ghost"],
             QWidget#rootSurface QToolButton[variant="ghost"] {
-                background: #f2f4f6;
-                color: #4e5968;
-                border: 1px solid #e5e8eb;
+                background: #f2f2f7;
+                color: #3a3a3c;
+                border: 1px solid rgba(60, 60, 67, 0.12);
             }
             QWidget#rootSurface QPushButton[variant="ghost"]:hover,
             QWidget#rootSurface QToolButton[variant="ghost"]:hover {
-                background: #e9edf2;
+                background: #e5e5ea;
             }
             QWidget#rootSurface QPushButton[variant="danger"] {
-                background: #fff1f2;
-                color: #e5484d;
-                border: 1px solid #ffd6d9;
+                background: #fff0ef;
+                color: #ff3b30;
+                border: 1px solid rgba(255, 59, 48, 0.20);
             }
             QWidget#rootSurface QPushButton[variant="danger"]:hover {
-                background: #ffe5e8;
+                background: #ffe2df;
+            }
+            CalendarBoardWidget#mainBoard QFrame#calendarNav {
+                background: #f2f2f7;
+                border: 1px solid rgba(60, 60, 67, 0.12);
+                border-radius: 12px;
+            }
+            CalendarBoardWidget#mainBoard QFrame#calendarNav QPushButton#calendarNavButton {
+                background: transparent;
+                color: #3a3a3c;
+                border: none;
+                border-radius: 9px;
+                padding: 7px 12px;
+                font-weight: 700;
+            }
+            CalendarBoardWidget#mainBoard QFrame#calendarNav QPushButton#calendarNavButton:hover {
+                background: rgba(255, 255, 255, 0.92);
+            }
+            CalendarBoardWidget#mainBoard QFrame#calendarNav QPushButton#calendarNavButton:pressed {
+                background: #dedee5;
             }
             CalendarBoardWidget#mainBoard QLabel#weekdayLabel {
-                background: #ffffff;
-                border: 1px solid #e5e8eb;
-                border-radius: 12px;
-                color: #4e5968;
+                background: #f7f7fa;
+                border: 1px solid rgba(60, 60, 67, 0.10);
+                border-radius: 10px;
+                color: #3a3a3c;
                 font-size: 9pt;
                 font-weight: 800;
             }
             CalendarBoardWidget#mainBoard DayCell {
                 background: #ffffff;
-                border: 1px solid #e5e8eb;
-                border-radius: 12px;
+                border: 1px solid rgba(60, 60, 67, 0.10);
+                border-radius: 10px;
                 min-height: 50px;
             }
             CalendarBoardWidget#mainBoard DayCell[class~="cellOther"] {
-                background: #f7f9fb;
-                border-color: #edf1f5;
+                background: #f7f7fa;
+                border-color: rgba(60, 60, 67, 0.06);
             }
             CalendarBoardWidget#mainBoard DayCell[class~="cellWeekend"] {
                 background: #fbfcfe;
             }
+            CalendarBoardWidget#mainBoard DayCell:hover {
+                background: #f5f9ff;
+                border: 1px solid rgba(0, 122, 255, 0.36);
+            }
+            CalendarBoardWidget#mainBoard DayCell[dropTarget="true"] {
+                background: #e1f0ff;
+                border: 2px solid #007aff;
+            }
+            CalendarBoardWidget#mainBoard DayCell QLabel#dropHint {
+                background: #007aff;
+                border: none;
+                border-radius: 9px;
+                color: #ffffff;
+                font-size: 8.5pt;
+                font-weight: 700;
+                padding: 4px 7px;
+            }
             CalendarBoardWidget#mainBoard DayCell[class~="cellToday"] {
-                border: 1px solid #3182f6;
-                background: #f2f7ff;
+                border: 2px solid #007aff;
+                background: #eef6ff;
             }
             CalendarBoardWidget#mainBoard DayCell[class~="cellSelected"] {
-                border: 1px solid #1769e0;
+                border: 2px solid #007aff;
                 background: #eaf3ff;
+            }
+            CalendarBoardWidget#mainBoard DayCell[dropTarget="true"] {
+                background: #e1f0ff;
+                border: 2px solid #007aff;
             }
             CalendarBoardWidget#mainBoard QLabel#dayLabel {
                 color: #191f28;
@@ -2717,15 +2969,16 @@ class MainWindow(QMainWindow):
                 font-weight: 800;
             }
             QWidget#rootSurface QLineEdit#searchField {
-                background: #ffffff;
-                border: 1px solid #e5e8eb;
-                border-radius: 12px;
+                background: #f2f2f7;
+                border: 1px solid rgba(60, 60, 67, 0.10);
+                border-radius: 11px;
                 padding: 9px 12px;
-                color: #191f28;
-                selection-background-color: rgba(49, 130, 246, 0.18);
+                color: #1c1c1e;
+                selection-background-color: rgba(0, 122, 255, 0.20);
             }
             QWidget#rootSurface QLineEdit#searchField:focus {
-                border: 1px solid #3182f6;
+                background: #ffffff;
+                border: 2px solid #007aff;
             }
             QStatusBar {
                 background: #f7f9fb;
@@ -2791,25 +3044,39 @@ class MainWindow(QMainWindow):
         p = overlay_theme_palette(self.config.overlay_theme)
         opacity = max(50, min(100, int(self.config.overlay_opacity))) / 100
         scale = max(0.8, min(1.4, int(self.config.overlay_font_scale) / 100))
+        chrome_alpha = max(0.68, min(0.86, 0.54 + opacity * 0.28))
+        cell_alpha = max(0.78, min(0.94, 0.70 + opacity * 0.24))
+        muted_cell_alpha = max(0.70, cell_alpha - 0.10)
+        footer_alpha = max(0.74, cell_alpha - 0.05)
 
         def pt(value: float) -> str:
             return f"{value * scale:.1f}pt"
 
         return f"""
             QFrame#overlayShell {{
-                background: rgba({p["shell_rgb"]}, {opacity:.2f});
-                border: 1px solid {p["shell_border"]};
-                border-radius: 22px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 rgba({p["shell_rgb"]}, {min(0.96, opacity * 0.78):.2f}),
+                    stop: 0.38 rgba(255, 255, 255, {min(0.10, opacity * 0.07):.2f}),
+                    stop: 1 rgba({p["shell_rgb"]}, {min(0.98, opacity * 0.90):.2f})
+                );
+                border: 1px solid rgba(255, 255, 255, 0.34);
+                border-radius: 28px;
             }}
             QFrame#overlayShell QFrame#overlayChrome {{
-                background: {p["chrome_bg"]};
-                border: 1px solid {p["chrome_border"]};
-                border-radius: 18px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 rgba(255, 255, 255, 0.15),
+                    stop: 1 rgba({p["shell_rgb"]}, {chrome_alpha:.2f})
+                );
+                border: 1px solid rgba(255, 255, 255, 0.26);
+                border-radius: 20px;
             }}
             QFrame#overlayShell QLabel#overlayTitle {{
                 color: {p["overlay_title"]};
                 font-size: {pt(13.5)};
                 font-weight: 700;
+                letter-spacing: 0.2px;
             }}
             QFrame#overlayShell QLabel#boardTitle {{
                 color: {p["board_title"]};
@@ -2820,10 +3087,30 @@ class MainWindow(QMainWindow):
                 color: {p["tip"]};
                 font-size: {pt(10)};
             }}
-            QFrame#overlayShell QLabel#weekdayLabel {{
-                background: {p["weekday_bg"]};
-                border: 1px solid {p["weekday_border"]};
+            QFrame#overlayShell QFrame#calendarNav {{
+                background: rgba({p["shell_rgb"]}, {chrome_alpha:.2f});
+                border: 1px solid rgba(255, 255, 255, 0.20);
+                border-radius: 13px;
+            }}
+            QFrame#overlayShell QFrame#calendarNav QPushButton#calendarNavButton {{
+                background: transparent;
+                color: {p["footer"]};
+                border: none;
                 border-radius: 10px;
+                padding: 8px 13px;
+                font-size: {pt(10)};
+                font-weight: 700;
+            }}
+            QFrame#overlayShell QFrame#calendarNav QPushButton#calendarNavButton:hover {{
+                background: rgba(255, 255, 255, 0.14);
+            }}
+            QFrame#overlayShell QFrame#calendarNav QPushButton#calendarNavButton:pressed {{
+                background: rgba(255, 255, 255, 0.22);
+            }}
+            QFrame#overlayShell QLabel#weekdayLabel {{
+                background: rgba({p["shell_rgb"]}, {cell_alpha:.2f});
+                border: 1px solid rgba(255, 255, 255, 0.20);
+                border-radius: 12px;
                 color: {p["weekday"]};
                 font-size: {pt(10.5)};
                 font-weight: 700;
@@ -2836,23 +3123,44 @@ class MainWindow(QMainWindow):
                 color: {p["weekday_sat"]};
             }}
             QFrame#overlayShell DayCell {{
-                background: {p["cell_bg"]};
-                border: 1px solid {p["cell_border"]};
-                border-radius: 14px;
+                background: rgba({p["shell_rgb"]}, {cell_alpha:.2f});
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 16px;
             }}
             QFrame#overlayShell DayCell[class~="cellOther"] {{
-                background: {p["cell_other"]};
+                background: rgba({p["shell_rgb"]}, {muted_cell_alpha:.2f});
             }}
             QFrame#overlayShell DayCell[class~="cellWeekend"] {{
-                background: {p["cell_weekend"]};
+                background: rgba({p["shell_rgb"]}, {min(0.96, cell_alpha + 0.01):.2f});
+            }}
+            QFrame#overlayShell DayCell:hover {{
+                background: rgba({p["shell_rgb"]}, {min(0.98, cell_alpha + 0.03):.2f});
+                border: 1px solid rgba(214, 240, 255, 0.52);
+            }}
+            QFrame#overlayShell DayCell[dropTarget="true"] {{
+                background: rgba(104, 191, 255, 0.34);
+                border: 2px solid rgba(220, 246, 255, 0.96);
+            }}
+            QFrame#overlayShell DayCell QLabel#dropHint {{
+                background: rgba(210, 241, 255, 0.18);
+                border: 1px solid rgba(220, 246, 255, 0.48);
+                border-radius: 9px;
+                color: #f2fbff;
+                font-size: {pt(8.8)};
+                font-weight: 700;
+                padding: 4px 7px;
             }}
             QFrame#overlayShell DayCell[class~="cellToday"] {{
-                border: 2px solid {p["today_border"]};
-                background: {p["today_bg"]};
+                border: 2px solid rgba(255, 224, 126, 0.96);
+                background: rgba(255, 211, 102, 0.16);
             }}
             QFrame#overlayShell DayCell[class~="cellSelected"] {{
-                border: 2px solid {p["selected_border"]};
-                background: {p["selected_bg"]};
+                border: 2px solid rgba(206, 239, 255, 0.92);
+                background: rgba(116, 196, 255, 0.22);
+            }}
+            QFrame#overlayShell DayCell[dropTarget="true"] {{
+                background: rgba(104, 191, 255, 0.34);
+                border: 2px solid rgba(220, 246, 255, 0.96);
             }}
             QFrame#overlayShell QLabel#dayLabel {{
                 background: transparent;
@@ -2871,24 +3179,24 @@ class MainWindow(QMainWindow):
             }}
             QFrame#overlayShell QLabel#dayBadge,
             QFrame#overlayShell QLabel#pathChip {{
-                background: {p["chip_bg"]};
-                border: 1px solid {p["chip_border"]};
-                border-radius: 10px;
+                background: rgba(255, 255, 255, 0.11);
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 11px;
                 color: {p["chip"]};
                 font-size: {pt(9.5)};
                 font-weight: 600;
                 padding: 4px 9px;
             }}
             QFrame#overlayShell QLabel#boardFooter {{
-                background: {p["footer_bg"]};
-                border: 1px solid {p["footer_border"]};
-                border-radius: 13px;
+                background: rgba({p["shell_rgb"]}, {footer_alpha:.2f});
+                border: 1px solid rgba(255, 255, 255, 0.18);
+                border-radius: 15px;
                 color: {p["footer"]};
                 font-size: {pt(10.5)};
                 padding: 11px 14px;
             }}
             QFrame#overlayShell QPushButton {{
-                padding: 10px 18px;
+                padding: 9px 16px;
                 font-size: {pt(10.5)};
             }}
             QFrame#overlayShell QPushButton[variant="secondary"] {{
@@ -2899,6 +3207,9 @@ class MainWindow(QMainWindow):
             QFrame#overlayShell QPushButton[variant="secondary"]:hover {{
                 background: {p["btn_secondary_hover"]};
             }}
+            QFrame#overlayShell QPushButton[variant="secondary"]:pressed {{
+                background: rgba(255, 255, 255, 0.30);
+            }}
             QFrame#overlayShell QPushButton[variant="ghost"] {{
                 background: {p["btn_ghost_bg"]};
                 color: {p["btn_ghost"]};
@@ -2906,6 +3217,14 @@ class MainWindow(QMainWindow):
             }}
             QFrame#overlayShell QPushButton[variant="ghost"]:hover {{
                 background: {p["btn_ghost_hover"]};
+            }}
+            QFrame#overlayShell QPushButton[variant="ghost"]:pressed {{
+                background: rgba(255, 255, 255, 0.20);
+            }}
+            QFrame#overlayShell QSizeGrip {{
+                width: 18px;
+                height: 18px;
+                background: transparent;
             }}
         """
 
@@ -3340,7 +3659,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"불러오기 실패: {exc}")
 
     def _refresh_events(self, *, preferred_path: Path | None = None) -> None:
-        self.events_by_date = load_events(self.config.event_dir)
+        completed_event_keys = load_completed_event_keys()
+        self.events_by_date = {
+            event_date: [replace(event, completed=event_key(event.file_path) in completed_event_keys) for event in events]
+            for event_date, events in load_events(self.config.event_dir).items()
+        }
         self.board.set_events(self.events_by_date)
         if self.overlay_window is not None:
             self.overlay_window.set_events(self.events_by_date)
@@ -3496,6 +3819,25 @@ class MainWindow(QMainWindow):
         if self.overlay_window is not None:
             self.overlay_window.set_selected_date(date)
         self._populate_event_list(date)
+
+    def open_event_todo_for_current_date(self) -> None:
+        self.open_event_todo(self.board.selected_date)
+
+    def open_event_todo(self, event_date: dt.date, *, parent: QWidget | None = None) -> None:
+        dialog = EventTodoDialog(
+            event_date,
+            event_provider=lambda date: self.events_by_date.get(date, []),
+            on_toggle=self._set_event_completed,
+            parent=parent or self,
+        )
+        dialog.exec()
+
+    def open_overlay_event_todo(self, event_date: dt.date) -> None:
+        self.open_event_todo(event_date, parent=self.overlay_window)
+
+    def _set_event_completed(self, event_path: Path, completed: bool) -> None:
+        set_event_completed(event_path, completed)
+        self._refresh_events()
 
     def on_event_selected(self, *_args) -> None:
         self._sync_item_widget_selection(self.event_list)
@@ -3804,6 +4146,7 @@ class MainWindow(QMainWindow):
             self.overlay_window.set_selected_date(self.board.selected_date)
             self.overlay_window.board.date_selected.connect(self.on_date_selected)
             self.overlay_window.manage_requested.connect(self.open_day_manager)
+            self.overlay_window.todo_requested.connect(self.open_overlay_event_todo)
             self.overlay_window.settings_requested.connect(self.open_overlay_settings)
             self.overlay_window.message_dropped.connect(self.on_message_dropped)
             self.overlay_window.closed.connect(self._overlay_closed)
