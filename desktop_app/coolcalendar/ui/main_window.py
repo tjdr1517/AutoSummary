@@ -4,6 +4,8 @@ import calendar as pycalendar
 import datetime as dt
 import json
 import os
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from html import escape as html_escape
@@ -43,7 +45,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMenu,
-    QMessageBox,
     QPushButton,
     QRadioButton,
     QSizeGrip,
@@ -75,10 +76,21 @@ from coolcalendar.services.desktop import (
     window_screen_bounds,
 )
 from coolcalendar.services.event_state import event_key, load_completed_event_keys, set_event_completed
-from coolcalendar.services.events import create_event, create_event_from_message, delete_event, load_events, update_event
+from coolcalendar.services.events import (
+    TrashedEvent,
+    create_event,
+    create_event_from_message,
+    load_events,
+    load_trashed_events,
+    move_event_to_trash,
+    permanently_delete_trashed_event,
+    restore_trashed_event,
+    update_event,
+)
 from coolcalendar.services.google_calendar import (
     GoogleCalendarSyncError,
     connect_google_calendar,
+    delete_synced_event,
     google_calendar_ready,
     import_events,
     move_sync_mapping,
@@ -372,6 +384,173 @@ class ChromeDialog(QDialog):
         QTimer.singleShot(0, self._place_in_screen)
 
 
+class AppAlertDialog(QDialog):
+    """A focused confirmation surface, intentionally separate from full settings dialogs."""
+
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        *,
+        tone: str = "info",
+        confirm_text: str = "확인",
+        cancel_text: str | None = None,
+        parent: QWidget | None = None,
+        stay_on_top: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("appAlertDialog")
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFixedWidth(480)
+        if stay_on_top:
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+        outer.setSpacing(0)
+
+        shell = QFrame()
+        shell.setObjectName("alertShell")
+        apply_shadow(shell, blur=38, alpha=122, y_offset=13)
+        shell.setStyleSheet(
+            """
+            QFrame#alertShell {
+                background: qlineargradient(x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 rgba(20, 43, 66, 0.98), stop: 1 rgba(11, 29, 47, 0.98));
+                border: 1px solid rgba(210, 235, 250, 0.18);
+                border-radius: 24px;
+            }
+            QLabel#alertTitle { color: #f7fbff; font-size: 15pt; font-weight: 700; }
+            QLabel#alertMessage { color: #c8ddec; font-size: 10.5pt; line-height: 1.45; }
+            QPushButton#alertCancel {
+                background: rgba(255, 255, 255, 0.08); color: #d7e9f6;
+                border: 1px solid rgba(230, 244, 252, 0.14); border-radius: 12px; padding: 0 16px;
+            }
+            QPushButton#alertCancel:hover { background: rgba(255, 255, 255, 0.14); }
+            QPushButton#alertConfirm {
+                background: rgba(118, 196, 255, 0.26); color: #f8fcff;
+                border: 1px solid rgba(170, 223, 255, 0.46); border-radius: 12px; padding: 0 18px; font-weight: 700;
+            }
+            QPushButton#alertConfirm:hover { background: rgba(118, 196, 255, 0.38); }
+            QPushButton#alertConfirm:pressed, QPushButton#alertCancel:pressed { background: rgba(255, 255, 255, 0.20); }
+            QPushButton#alertConfirm[destructive="true"] {
+                background: rgba(226, 93, 106, 0.78); border-color: rgba(255, 180, 188, 0.46);
+            }
+            QPushButton#alertConfirm[destructive="true"]:hover { background: rgba(238, 108, 121, 0.94); }
+            """
+        )
+        outer.addWidget(shell)
+        layout = QVBoxLayout(shell)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(18)
+
+        headline = QHBoxLayout()
+        headline.setSpacing(12)
+        layout.addLayout(headline)
+
+        icon = QFrame()
+        icon.setObjectName("alertIcon")
+        icon.setFixedSize(38, 38)
+        icon_colors = {
+            "info": ("rgba(88, 181, 255, 0.24)", "rgba(153, 216, 255, 0.50)"),
+            "question": ("rgba(88, 181, 255, 0.24)", "rgba(153, 216, 255, 0.50)"),
+            "warning": ("rgba(236, 173, 84, 0.24)", "rgba(255, 215, 140, 0.50)"),
+            "error": ("rgba(232, 101, 113, 0.24)", "rgba(255, 178, 187, 0.50)"),
+        }
+        icon_background, icon_border = icon_colors.get(tone, icon_colors["info"])
+        icon.setStyleSheet(f"background: {icon_background}; border: 1px solid {icon_border}; border-radius: 19px;")
+        icon_layout = QVBoxLayout(icon)
+        icon_layout.setContentsMargins(0, 0, 0, 0)
+        glyph = QLabel({"info": "i", "warning": "!", "error": "!", "question": "?"}.get(tone, "i"))
+        glyph.setAlignment(Qt.AlignCenter)
+        glyph.setStyleSheet("color: #f8fcff; font-size: 17pt; font-weight: 700; background: transparent; border: none;")
+        icon_layout.addWidget(glyph)
+        headline.addWidget(icon)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("alertTitle")
+        headline.addWidget(title_label, 1)
+
+        self.message_label = QLabel(message)
+        self.message_label.setObjectName("alertMessage")
+        self.message_label.setWordWrap(True)
+        self.message_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.message_label)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        layout.addLayout(actions)
+        actions.addStretch(1)
+
+        if cancel_text:
+            cancel_button = QPushButton(cancel_text)
+            cancel_button.setObjectName("alertCancel")
+            cancel_button.setFixedHeight(42)
+            cancel_button.clicked.connect(self.reject)
+            actions.addWidget(cancel_button)
+
+        confirm_button = QPushButton(confirm_text)
+        confirm_button.setObjectName("alertConfirm")
+        confirm_button.setProperty("destructive", tone == "error")
+        confirm_button.setFixedHeight(42)
+        confirm_button.setMinimumWidth(104)
+        confirm_button.setDefault(True)
+        confirm_button.clicked.connect(self.accept)
+        actions.addWidget(confirm_button)
+        self.adjustSize()
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        parent = self.parentWidget()
+        if parent is not None and parent.isVisible() and not parent.isMinimized():
+            screen = QApplication.screenAt(parent.frameGeometry().center())
+            center = parent.frameGeometry().center()
+        else:
+            screen = QApplication.primaryScreen()
+            rect = screen.availableGeometry() if screen is not None else QRect(0, 0, 1600, 900)
+            center = rect.center()
+        rect = screen.availableGeometry() if screen is not None else QRect(0, 0, 1600, 900)
+        self.move(center.x() - self.width() // 2, center.y() - self.height() // 2)
+
+
+def show_info(parent: QWidget | None, title: str, message: str) -> None:
+    AppAlertDialog(title, message, tone="info", parent=parent).exec()
+
+
+def show_warning(parent: QWidget | None, title: str, message: str) -> None:
+    AppAlertDialog(title, message, tone="warning", parent=parent).exec()
+
+
+def show_error(parent: QWidget | None, title: str, message: str) -> None:
+    AppAlertDialog(title, message, tone="error", parent=parent).exec()
+
+
+def ask_confirmation(
+    parent: QWidget | None,
+    title: str,
+    message: str,
+    *,
+    confirm_text: str = "확인",
+    cancel_text: str = "취소",
+    destructive: bool = False,
+    stay_on_top: bool = False,
+) -> bool:
+    tone = "error" if destructive else "question"
+    dialog = AppAlertDialog(
+        title,
+        message,
+        tone=tone,
+        confirm_text=confirm_text,
+        cancel_text=cancel_text,
+        parent=parent,
+        stay_on_top=stay_on_top,
+    )
+    return dialog.exec() == QDialog.Accepted
+
+
 class BackdropWidget(QWidget):
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
@@ -645,7 +824,7 @@ class EventEditorDialog(ChromeDialog):
 
     def accept(self) -> None:  # type: ignore[override]
         if not self.title_edit.text().strip():
-            QMessageBox.information(self, "제목 필요", "일정 제목을 입력해 주세요.")
+            show_info(self, "제목 필요", "일정 제목을 입력해 주세요.")
             self.title_edit.setFocus()
             return
         super().accept()
@@ -674,7 +853,7 @@ class DayEventManagerDialog(ChromeDialog):
 
         super().__init__(
             f"{event_date.strftime('%Y.%m.%d')} 일정 관리",
-            "선택한 날짜의 일정을 여기서 추가, 수정, 삭제하고 파일까지 바로 열 수 있습니다.",
+            "선택한 날짜의 일정을 여기서 추가, 수정, 휴지통 이동하고 파일까지 바로 열 수 있습니다.",
             parent=parent,
         )
         self.resize(620, 740)
@@ -720,7 +899,7 @@ class DayEventManagerDialog(ChromeDialog):
         self.edit_button.clicked.connect(self._edit_event)
         button_row.addWidget(self.edit_button)
 
-        self.delete_button = QPushButton("삭제")
+        self.delete_button = QPushButton("휴지통으로 이동")
         self.delete_button.setProperty("variant", "danger")
         self.delete_button.setFixedHeight(44)
         self.delete_button.clicked.connect(self._delete_event)
@@ -969,7 +1148,7 @@ class AISettingsDialog(ChromeDialog):
     def accept(self) -> None:  # type: ignore[override]
         payload = self.payload()
         if payload["ai_auto_enabled"] and not resolved_api_key(str(payload["openai_api_key"])):
-            QMessageBox.information(
+            show_info(
                 self,
                 "API 키 필요",
                 "자동 분석을 켜려면 API 키를 입력하거나 OPENAI_API_KEY 환경변수를 설정해 주세요.",
@@ -1075,7 +1254,7 @@ class GoogleCalendarSettingsDialog(ChromeDialog):
         if payload["google_calendar_enabled"] and (
             not str(payload["google_oauth_client_id"]) or not str(payload["google_oauth_client_secret"])
         ):
-            QMessageBox.information(
+            show_info(
                 self,
                 "OAuth 정보 필요",
                 "Google Calendar 자동 등록을 켜려면 Client ID와 Client Secret을 입력해 주세요.",
@@ -1443,6 +1622,108 @@ class EventTodoDialog(ChromeDialog):
         self._refresh()
 
 
+class EventTrashDialog(ChromeDialog):
+    def __init__(
+        self,
+        *,
+        event_provider: Callable[[], list[TrashedEvent]],
+        on_restore: Callable[[Path], bool],
+        on_delete_forever: Callable[[Path], bool],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__("일정 휴지통", "삭제한 일정은 여기서 복원하거나 영구 삭제할 수 있습니다.", parent=parent)
+        self.event_provider = event_provider
+        self.on_restore = on_restore
+        self.on_delete_forever = on_delete_forever
+        self.resize(590, 660)
+        self.set_meta_text("복원 가능한 일정")
+
+        summary_row = QHBoxLayout()
+        summary_row.setSpacing(10)
+        self.body_layout.addLayout(summary_row)
+        self.count_chip = QLabel("")
+        self.count_chip.setObjectName("softChip")
+        summary_row.addWidget(self.count_chip)
+        summary_row.addStretch(1)
+
+        self.event_list = QListWidget()
+        self.event_list.setObjectName("eventTodoList")
+        self.event_list.setSpacing(7)
+        self.event_list.currentItemChanged.connect(self._update_actions)
+        self.body_layout.addWidget(self.event_list, 1)
+
+        self.empty_label = QLabel("휴지통이 비어 있습니다.")
+        self.empty_label.setObjectName("dialogHint")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.body_layout.addWidget(self.empty_label)
+
+        action_row = QHBoxLayout()
+        action_row.setSpacing(10)
+        self.body_layout.addLayout(action_row)
+        self.restore_button = QPushButton("복원")
+        self.restore_button.setProperty("variant", "secondary")
+        self.restore_button.setFixedHeight(42)
+        self.restore_button.clicked.connect(self._restore_current)
+        action_row.addWidget(self.restore_button)
+
+        self.delete_forever_button = QPushButton("영구 삭제")
+        self.delete_forever_button.setProperty("variant", "danger")
+        self.delete_forever_button.setFixedHeight(42)
+        self.delete_forever_button.clicked.connect(self._delete_current_forever)
+        action_row.addWidget(self.delete_forever_button)
+        action_row.addStretch(1)
+
+        close_button = QPushButton("닫기")
+        close_button.setProperty("variant", "ghost")
+        close_button.setFixedHeight(42)
+        close_button.clicked.connect(self.accept)
+        action_row.addWidget(close_button)
+        self._refresh()
+
+    def _current_path(self) -> Path | None:
+        item = self.event_list.currentItem()
+        if item is None:
+            return None
+        return Path(str(item.data(Qt.UserRole)))
+
+    def _refresh(self) -> None:
+        selected_path = self._current_path()
+        entries = self.event_provider()
+        self.event_list.clear()
+        for entry in entries:
+            event = entry.event
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, str(entry.file_path))
+            item.setToolTip(f"원래 위치: {entry.original_path}\n휴지통 이동: {entry.deleted_at.strftime('%Y-%m-%d %H:%M')}")
+            card = EventCardWidget(event)
+            item.setSizeHint(QSize(0, max(104, card.sizeHint().height() + 6)))
+            self.event_list.addItem(item)
+            self.event_list.setItemWidget(item, card)
+            if selected_path == entry.file_path:
+                self.event_list.setCurrentItem(item)
+
+        if self.event_list.currentItem() is None and self.event_list.count():
+            self.event_list.setCurrentRow(0)
+        self.count_chip.setText(f"휴지통 {len(entries)}건")
+        self.empty_label.setVisible(not entries)
+        self._update_actions()
+
+    def _update_actions(self, *_args) -> None:
+        has_entry = self._current_path() is not None
+        self.restore_button.setEnabled(has_entry)
+        self.delete_forever_button.setEnabled(has_entry)
+
+    def _restore_current(self) -> None:
+        path = self._current_path()
+        if path is not None and self.on_restore(path):
+            self._refresh()
+
+    def _delete_current_forever(self) -> None:
+        path = self._current_path()
+        if path is not None and self.on_delete_forever(path):
+            self._refresh()
+
+
 class DayCell(QFrame):
     selected = Signal(object)
     message_dropped = Signal(object, int)
@@ -1787,6 +2068,7 @@ class OverlayBoardWindow(QWidget):
     message_dropped = Signal(object, int)
     manage_requested = Signal(object)
     todo_requested = Signal(object)
+    trash_requested = Signal()
     settings_requested = Signal()
 
     def __init__(self) -> None:
@@ -1842,6 +2124,12 @@ class OverlayBoardWindow(QWidget):
         todo_btn.setProperty("variant", "secondary")
         todo_btn.clicked.connect(self._emit_todo_requested)
         chrome_layout.addWidget(todo_btn)
+
+        trash_btn = QPushButton("휴지통")
+        trash_btn.setProperty("variant", "ghost")
+        trash_btn.setToolTip("삭제한 일정을 복원하거나 영구 삭제합니다.")
+        trash_btn.clicked.connect(self.trash_requested.emit)
+        chrome_layout.addWidget(trash_btn)
 
         settings_btn = QPushButton("보드 설정")
         settings_btn.setProperty("variant", "ghost")
@@ -1975,6 +2263,7 @@ class MainWindow(QMainWindow):
         self.message_service = MessageService(config.db_path)
         self.messages_by_key: dict[int, Message] = {}
         self._all_messages: list[Message] = []
+        self._message_search_index: dict[int, str] = {}
         self.analysis_store = AIAnalysisStore(default_analysis_store_path(config.db_path))
         self.message_analyses: dict[int, MessageAnalysis] = self.analysis_store.values()
         self.events_by_date: dict[dt.date, list[CalendarEvent]] = {}
@@ -1987,6 +2276,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CoolCalendar Desktop")
         self.setMinimumSize(780, 560)
         self._build_ui()
+        self._message_search_timer = QTimer(self)
+        self._message_search_timer.setSingleShot(True)
+        self._message_search_timer.setInterval(120)
+        self._message_search_timer.timeout.connect(self._render_message_list)
         self._apply_styles()
         if self.config.main_geometry:
             self._restore_geometry(self, self.config.main_geometry)
@@ -2080,6 +2373,11 @@ class MainWindow(QMainWindow):
                 "새로고침", self._load_all, variant="ghost", tooltip="메시지와 일정을 지금 다시 불러옵니다."
             )
         )
+        action_box.addWidget(
+            self._make_button(
+                "재시작", self.restart_application, variant="ghost", tooltip="저장된 설정으로 앱을 다시 시작합니다."
+            )
+        )
 
         tools_button = QToolButton()
         tools_button.setText("설정 및 동기화")
@@ -2129,7 +2427,7 @@ class MainWindow(QMainWindow):
         self.message_search.setObjectName("searchField")
         self.message_search.setPlaceholderText("메시지 검색  (보낸 사람 · 제목 · 내용)")
         self.message_search.setClearButtonEnabled(True)
-        self.message_search.textChanged.connect(self._render_message_list)
+        self.message_search.textChanged.connect(self._schedule_message_render)
         left_layout.addWidget(self.message_search)
 
         self.message_list = MessageListWidget()
@@ -2194,6 +2492,9 @@ class MainWindow(QMainWindow):
         )
         event_toolbar.addWidget(self.event_todo_btn)
 
+        self.event_trash_btn = self._make_button("휴지통", self.open_event_trash, variant="ghost", tooltip="삭제한 일정을 복원하거나 영구 삭제합니다.")
+        event_toolbar.addWidget(self.event_trash_btn)
+
         self.edit_event_btn = self._make_button("수정", self.edit_current_event, variant="ghost", tooltip="선택한 일정을 수정합니다.")
         self.edit_event_btn.setEnabled(False)
         event_toolbar.addWidget(self.edit_event_btn)
@@ -2202,7 +2503,7 @@ class MainWindow(QMainWindow):
         self.open_event_btn.setEnabled(False)
         event_toolbar.addWidget(self.open_event_btn)
 
-        self.delete_event_btn = self._make_button("삭제", self.delete_current_event, variant="danger", tooltip="선택한 일정을 삭제합니다.")
+        self.delete_event_btn = self._make_button("휴지통", self.delete_current_event, variant="danger", tooltip="선택한 일정을 휴지통으로 이동합니다.")
         self.delete_event_btn.setEnabled(False)
         event_toolbar.addWidget(self.delete_event_btn)
 
@@ -2301,6 +2602,36 @@ class MainWindow(QMainWindow):
             }
             QFrame#dialogSectionSoft {
                 background: rgba(255, 255, 255, 0.045);
+            }
+            QFrame#alertContent {
+                background: rgba(5, 17, 29, 0.44);
+                border: 1px solid rgba(190, 226, 246, 0.12);
+                border-radius: 20px;
+            }
+            QFrame#alertIcon {
+                border-radius: 22px;
+            }
+            QFrame#alertIcon[tone="info"], QFrame#alertIcon[tone="question"] {
+                background: rgba(85, 175, 255, 0.20);
+                border: 1px solid rgba(142, 209, 255, 0.38);
+            }
+            QFrame#alertIcon[tone="warning"] {
+                background: rgba(236, 173, 84, 0.20);
+                border: 1px solid rgba(255, 212, 134, 0.38);
+            }
+            QFrame#alertIcon[tone="error"] {
+                background: rgba(241, 99, 112, 0.20);
+                border: 1px solid rgba(255, 165, 173, 0.38);
+            }
+            QLabel#alertIconGlyph {
+                color: #f4fbff;
+                font-size: 20pt;
+                font-weight: 800;
+            }
+            QLabel#alertMessage {
+                color: #e5f3fb;
+                font-size: 10.5pt;
+                line-height: 1.45;
             }
             QLabel#heroEyebrow {
                 color: #a8d9ff;
@@ -3473,12 +3804,12 @@ class MainWindow(QMainWindow):
         if not messages:
             return
         if self.ai_worker is not None:
-            QMessageBox.information(self, "AI 분석 진행 중", "현재 다른 메시지 분석이 진행 중입니다. 잠시 후 다시 시도해 주세요.")
+            show_info(self, "AI 분석 진행 중", "현재 다른 메시지 분석이 진행 중입니다. 잠시 후 다시 시도해 주세요.")
             return
 
         api_key = resolved_api_key(self.config.openai_api_key)
         if not api_key:
-            QMessageBox.information(self, "API 키 필요", "먼저 AI 설정에서 OpenAI API 키를 입력해 주세요.")
+            show_info(self, "API 키 필요", "먼저 AI 설정에서 OpenAI API 키를 입력해 주세요.")
             return
 
         self.ai_pending_count = len(messages)
@@ -3573,7 +3904,7 @@ class MainWindow(QMainWindow):
             if message is not None:
                 analysis = self._analysis_for_message(message.key)
                 if analysis is not None and analysis.error:
-                    QMessageBox.warning(self, "AI 분석 실패", analysis.error)
+                    show_warning(self, "AI 분석 실패", analysis.error)
                 elif analysis is not None and analysis.should_create_event and not analysis.auto_created_event_path:
                     if self._confirm_and_create_event(message, analysis):
                         created_count += 1
@@ -3599,32 +3930,28 @@ class MainWindow(QMainWindow):
         return created
 
     def _confirm_and_create_event(self, message: Message, analysis: MessageAnalysis) -> bool:
-        box = QMessageBox(self)
-        box.setWindowTitle("AI 일정 추천")
-        box.setIcon(QMessageBox.Question)
-        box.setText("AI가 메시지에서 일정 등록이 필요한 항목을 찾았습니다.")
-        box.setInformativeText(
-            (
-                f"보낸 사람: {message.peer or '(이름 없음)'}\n"
-                f"요약: {analysis.summary or shorten_text(message.preview, 80) or '-'}\n"
-                f"추천 제목: {analysis.event_title or '(제목 없음)'}\n"
-                f"감지 기한: {analysis.due_date or '-'} {analysis.due_time or ''}\n\n"
-                "지금 일정으로 등록할까요?"
-            ).strip()
+        message_text = (
+            f"AI가 메시지에서 일정 등록이 필요한 항목을 찾았습니다.\n\n"
+            f"보낸 사람  {message.peer or '(이름 없음)'}\n"
+            f"요약  {analysis.summary or shorten_text(message.preview, 80) or '-'}\n"
+            f"추천 제목  {analysis.event_title or '(제목 없음)'}\n"
+            f"감지 기한  {analysis.due_date or '-'} {analysis.due_time or ''}\n\n"
+            "이 일정으로 등록할까요?"
         )
-        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-        box.setDefaultButton(QMessageBox.Yes)
-        box.button(QMessageBox.Yes).setText("일정 등록")
-        box.button(QMessageBox.No).setText("건너뛰기")
-        # 다른 작업 중에도 새 메시지 알림이 보이도록 항상 위에 띄운다.
-        box.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        if box.exec() != QMessageBox.Yes:
+        if not ask_confirmation(
+            self,
+            "AI 일정 추천",
+            message_text,
+            confirm_text="일정 등록",
+            cancel_text="건너뛰기",
+            stay_on_top=True,
+        ):
             return False
 
         try:
             created_path = create_ai_event_from_analysis(message, analysis, self.config.event_dir)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "일정 생성 실패", str(exc))
+            show_warning(self, "일정 생성 실패", str(exc))
             return False
         if created_path is None:
             return False
@@ -3673,19 +4000,21 @@ class MainWindow(QMainWindow):
 
     def populate_messages(self, messages: list[Message]) -> None:
         self._all_messages = messages
+        self._message_search_index = {
+            message.key: " ".join((message.peer or "", message.title or "", message.body or "")).casefold()
+            for message in messages
+        }
+        self._message_search_timer.stop()
         self._render_message_list()
 
+    def _schedule_message_render(self, *_args) -> None:
+        self._message_search_timer.start()
+
     def _filtered_messages(self) -> list[Message]:
-        query = self.message_search.text().strip().lower()
+        query = self.message_search.text().strip().casefold()
         if not query:
             return self._all_messages
-        return [
-            message
-            for message in self._all_messages
-            if query in (message.peer or "").lower()
-            or query in (message.title or "").lower()
-            or query in (message.body or "").lower()
-        ]
+        return [message for message in self._all_messages if query in self._message_search_index.get(message.key, "")]
 
     def _render_message_list(self, *_args) -> None:
         messages = self._filtered_messages()
@@ -3694,23 +4023,28 @@ class MainWindow(QMainWindow):
         if current_item is not None:
             current_key = current_item.data(Qt.UserRole)
 
-        self.message_list.clear()
-        for message in messages:
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, message.key)
-            card = MessageCardWidget(message)
-            item.setSizeHint(QSize(0, max(92, card.sizeHint().height() + 6)))
-            self.message_list.addItem(item)
-            self.message_list.setItemWidget(item, card)
-            if current_key == message.key:
-                self.message_list.setCurrentItem(item)
+        self.message_list.setUpdatesEnabled(False)
+        self.message_list.blockSignals(True)
+        try:
+            self.message_list.clear()
+            for message in messages:
+                item = QListWidgetItem()
+                item.setData(Qt.UserRole, message.key)
+                card = MessageCardWidget(message)
+                item.setSizeHint(QSize(0, max(92, card.sizeHint().height() + 6)))
+                self.message_list.addItem(item)
+                self.message_list.setItemWidget(item, card)
+                if current_key == message.key:
+                    self.message_list.setCurrentItem(item)
 
-        if self.message_list.currentItem() is None and self.message_list.count():
-            self.message_list.setCurrentRow(self.message_list.count() - 1)
+            if self.message_list.currentItem() is None and self.message_list.count():
+                self.message_list.setCurrentRow(self.message_list.count() - 1)
+        finally:
+            self.message_list.blockSignals(False)
+            self.message_list.setUpdatesEnabled(True)
 
         self._sync_item_widget_selection(self.message_list)
-        self.add_selected_btn.setEnabled(self._current_message() is not None)
-        self.ai_analyze_btn.setEnabled(self._current_message() is not None and self.ai_worker is None)
+        self.on_message_selected()
         self._refresh_summary_tiles()
 
     def _populate_event_list(self, date: dt.date, *, preferred_path: Path | None = None) -> None:
@@ -3835,6 +4169,15 @@ class MainWindow(QMainWindow):
     def open_overlay_event_todo(self, event_date: dt.date) -> None:
         self.open_event_todo(event_date, parent=self.overlay_window)
 
+    def open_event_trash(self) -> None:
+        dialog = EventTrashDialog(
+            event_provider=lambda: load_trashed_events(self.config.event_dir),
+            on_restore=self.restore_event_from_trash,
+            on_delete_forever=self.permanently_delete_event_from_trash,
+            parent=self.overlay_window or self,
+        )
+        dialog.exec()
+
     def _set_event_completed(self, event_path: Path, completed: bool) -> None:
         set_event_completed(event_path, completed)
         self._refresh_events()
@@ -3862,7 +4205,7 @@ class MainWindow(QMainWindow):
             self._sync_google_event_path(created_path)
             self.statusBar().showMessage(f"{date.isoformat()} 일정으로 추가했습니다: {created_path.name}")
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "일정 추가 실패", str(exc))
+            show_error(self, "일정 추가 실패", str(exc))
 
     def _open_event_editor(
         self,
@@ -3906,7 +4249,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"일정을 수정했습니다: {updated_path.name}")
             return updated_path
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "일정 저장 실패", str(exc))
+            show_error(self, "일정 저장 실패", str(exc))
             return None
 
     def create_event_for_selected_date(self, date: dt.date) -> Path | None:
@@ -3924,7 +4267,7 @@ class MainWindow(QMainWindow):
     def edit_event_by_path(self, target_path: Path) -> Path | None:
         event = self._find_event_by_path(target_path)
         if event is None:
-            QMessageBox.information(self, "일정 없음", "수정할 일정을 찾지 못했습니다. 목록을 새로고침합니다.")
+            show_info(self, "일정 없음", "수정할 일정을 찾지 못했습니다. 목록을 새로고침합니다.")
             self._refresh_events()
             return None
         return self._open_event_editor(event.date, event=event)
@@ -3932,7 +4275,7 @@ class MainWindow(QMainWindow):
     def open_event_by_path(self, target_path: Path) -> None:
         event = self._find_event_by_path(target_path)
         if event is None or not event.file_path.exists():
-            QMessageBox.warning(self, "파일 없음", "일정 파일을 찾을 수 없습니다. 목록을 새로고침합니다.")
+            show_warning(self, "파일 없음", "일정 파일을 찾을 수 없습니다. 목록을 새로고침합니다.")
             self._refresh_events()
             return
         os.startfile(str(event.file_path))
@@ -3940,25 +4283,53 @@ class MainWindow(QMainWindow):
     def delete_event_by_path(self, target_path: Path) -> None:
         event = self._find_event_by_path(target_path)
         if event is None:
-            QMessageBox.information(self, "일정 없음", "삭제할 일정을 찾지 못했습니다. 목록을 새로고침합니다.")
+            show_info(self, "일정 없음", "휴지통으로 옮길 일정을 찾지 못했습니다. 목록을 새로고침합니다.")
             self._refresh_events()
             return
-        answer = QMessageBox.question(
-            self,
-            "일정 삭제",
-            f"'{event.title}' 일정을 삭제할까요?\n삭제된 일정 파일은 되돌릴 수 없습니다.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            return
-
-        removed = delete_event(event.file_path)
+        trashed_path = move_event_to_trash(event.file_path)
         self._refresh_events()
-        if removed:
-            self.statusBar().showMessage(f"로컬 일정을 삭제했습니다: {event.title}")
+        if trashed_path is not None:
+            move_sync_mapping(event.file_path, trashed_path)
+            self.statusBar().showMessage(f"휴지통으로 이동했습니다: {event.title}")
         else:
-            QMessageBox.information(self, "이미 삭제됨", "해당 일정 파일이 이미 없어져 목록만 새로고침했습니다.")
+            show_info(self, "파일 없음", "해당 일정 파일을 찾지 못해 목록만 새로고침했습니다.")
+
+    def restore_event_from_trash(self, trashed_path: Path) -> bool:
+        restored_path = restore_trashed_event(self.config.event_dir, trashed_path)
+        if restored_path is None:
+            show_info(self, "복원 실패", "휴지통에서 해당 일정을 찾지 못했습니다.")
+            return False
+        move_sync_mapping(trashed_path, restored_path)
+        self._refresh_events(preferred_path=restored_path)
+        self.statusBar().showMessage(f"일정을 복원했습니다: {restored_path.name}")
+        return True
+
+    def permanently_delete_event_from_trash(self, trashed_path: Path) -> bool:
+        entry = next((item for item in load_trashed_events(self.config.event_dir) if item.file_path == trashed_path), None)
+        title = entry.event.title if entry is not None else trashed_path.stem
+        if not ask_confirmation(
+            self,
+            "일정 영구 삭제",
+            f"'{title}' 일정을 영구 삭제할까요?\n이 작업은 되돌릴 수 없습니다.",
+            confirm_text="영구 삭제",
+            cancel_text="취소",
+            destructive=True,
+        ):
+            return False
+        try:
+            delete_synced_event(self.config, trashed_path)
+        except GoogleCalendarSyncError as exc:
+            show_warning(self, "Google Calendar 삭제 실패", f"Google Calendar에서 일정을 지우지 못했습니다.\n{exc}")
+            return False
+        except Exception as exc:  # noqa: BLE001
+            show_warning(self, "Google Calendar 삭제 실패", f"Google Calendar에서 일정을 지우지 못했습니다.\n{exc}")
+            return False
+        removed = permanently_delete_trashed_event(self.config.event_dir, trashed_path)
+        if removed:
+            self.statusBar().showMessage(f"휴지통에서 영구 삭제했습니다: {title}")
+        else:
+            show_info(self, "이미 삭제됨", "휴지통에서 해당 일정을 찾지 못했습니다.")
+        return removed
 
     def open_day_manager(self, date: dt.date) -> None:
         self.on_date_selected(date)
@@ -4018,11 +4389,11 @@ class MainWindow(QMainWindow):
         try:
             connect_google_calendar(self.config)
         except GoogleCalendarSyncError as exc:
-            QMessageBox.warning(self, "Google Calendar 연결 실패", str(exc))
+            show_warning(self, "Google Calendar 연결 실패", str(exc))
             self.statusBar().showMessage("Google Calendar 연결에 실패했습니다.")
             return
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "Google Calendar 연결 실패", str(exc))
+            show_warning(self, "Google Calendar 연결 실패", str(exc))
             self.statusBar().showMessage("Google Calendar 연결에 실패했습니다.")
             return
 
@@ -4030,14 +4401,13 @@ class MainWindow(QMainWindow):
 
     def import_google_calendar_events(self) -> None:
         if not google_calendar_ready(self.config):
-            answer = QMessageBox.question(
+            if ask_confirmation(
                 self,
                 "Google Calendar 연동 필요",
                 "먼저 Google Calendar 연동을 설정해야 합니다. 지금 설정할까요?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if answer == QMessageBox.Yes:
+                confirm_text="설정 열기",
+                cancel_text="나중에",
+            ):
                 self.open_google_calendar_settings()
             return
 
@@ -4072,11 +4442,11 @@ class MainWindow(QMainWindow):
             uploaded_count = self._sync_google_events_in_range(start_date, end_date)
         except GoogleCalendarSyncError as exc:
             QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "Google Calendar 동기화 실패", str(exc))
+            show_warning(self, "Google Calendar 동기화 실패", str(exc))
             return
         except Exception as exc:  # noqa: BLE001
             QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "Google Calendar 동기화 실패", str(exc))
+            show_warning(self, "Google Calendar 동기화 실패", str(exc))
             return
         finally:
             while QApplication.overrideCursor() is not None:
@@ -4090,12 +4460,12 @@ class MainWindow(QMainWindow):
             f"Google 일정 가져오기/갱신: {len(imported_paths)}건"
         )
         self.statusBar().showMessage(message.replace("\n", " "))
-        QMessageBox.information(self, "Google Calendar 동기화 완료", message)
+        show_info(self, "Google Calendar 동기화 완료", message)
 
     def analyze_selected_message(self) -> None:
         message = self._current_message()
         if message is None:
-            QMessageBox.information(self, "메시지 선택", "먼저 AI로 분석할 메시지를 선택해 주세요.")
+            show_info(self, "메시지 선택", "먼저 AI로 분석할 메시지를 선택해 주세요.")
             return
         self._start_ai_worker([message], auto_create=False, force_reanalyze=True, mode="manual")
 
@@ -4116,14 +4486,14 @@ class MainWindow(QMainWindow):
     def add_selected_message_to_current_date(self) -> None:
         message = self._current_message()
         if message is None:
-            QMessageBox.information(self, "메시지 선택", "먼저 일정으로 옮길 메시지를 선택해 주세요.")
+            show_info(self, "메시지 선택", "먼저 일정으로 옮길 메시지를 선택해 주세요.")
             return
         self._create_event_for_message(message, self.board.selected_date)
 
     def on_message_dropped(self, date: dt.date, message_key: int) -> None:
         message = self.messages_by_key.get(message_key)
         if message is None:
-            QMessageBox.warning(self, "메시지 없음", "드래그한 메시지를 찾지 못했습니다.")
+            show_warning(self, "메시지 없음", "드래그한 메시지를 찾지 못했습니다.")
             return
         self._create_event_for_message(message, date)
 
@@ -4147,6 +4517,7 @@ class MainWindow(QMainWindow):
             self.overlay_window.board.date_selected.connect(self.on_date_selected)
             self.overlay_window.manage_requested.connect(self.open_day_manager)
             self.overlay_window.todo_requested.connect(self.open_overlay_event_todo)
+            self.overlay_window.trash_requested.connect(self.open_event_trash)
             self.overlay_window.settings_requested.connect(self.open_overlay_settings)
             self.overlay_window.message_dropped.connect(self.on_message_dropped)
             self.overlay_window.closed.connect(self._overlay_closed)
@@ -4206,6 +4577,39 @@ class MainWindow(QMainWindow):
     def open_event_dir(self) -> None:
         self.config.event_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(str(self.config.event_dir))
+
+    def restart_application(self) -> None:
+        if not ask_confirmation(
+            self,
+            "앱 재시작",
+            "CoolCalendar를 다시 시작할까요?\n열려 있는 설정 창의 저장하지 않은 내용은 사라집니다.",
+            confirm_text="재시작",
+            cancel_text="취소",
+        ):
+            return
+
+        launcher_path = Path(__file__).resolve().parents[3] / "run_desktop_calendar.bat"
+        if launcher_path.exists():
+            command = [os.environ.get("ComSpec", "cmd.exe"), "/c", str(launcher_path)]
+            working_directory = str(launcher_path.parent)
+        else:
+            app_path = Path(__file__).resolve().parents[1] / "app.py"
+            command = [sys.executable, str(app_path)]
+            working_directory = str(app_path.parent.parent)
+
+        try:
+            subprocess.Popen(
+                command,
+                cwd=working_directory,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            show_warning(self, "재시작 실패", f"새 앱 프로세스를 시작하지 못했습니다.\n{exc}")
+            return
+        app = QApplication.instance()
+        self.close()
+        if app is not None:
+            app.quit()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self.config.main_geometry = self._encode_geometry(self)

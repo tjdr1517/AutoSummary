@@ -1,12 +1,25 @@
 ﻿from __future__ import annotations
 
 import datetime as dt
+import json
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 from coolcalendar.models import CalendarEvent, Message
 from coolcalendar.services.event_state import clear_event_completion, move_event_completion
 from coolcalendar.services.messages import build_event_description, guess_event_time
+
+
+@dataclass(frozen=True)
+class TrashedEvent:
+    event: CalendarEvent
+    original_path: Path
+    deleted_at: dt.datetime
+
+    @property
+    def file_path(self) -> Path:
+        return self.event.file_path
 
 
 def desktop_event_dir() -> Path:
@@ -216,6 +229,128 @@ def delete_event(file_path: Path) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+def event_trash_dir(event_dir: Path) -> Path:
+    return event_dir / ".coolcalendar-trash"
+
+
+def move_event_to_trash(file_path: Path) -> Path | None:
+    """Move an event out of the active calendar while keeping it recoverable."""
+    if not file_path.exists():
+        return None
+
+    trash_dir = event_trash_dir(file_path.parent)
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    trashed_path = trash_dir / f"{uuid.uuid4().hex}-{file_path.name}"
+    file_path.replace(trashed_path)
+    move_event_completion(file_path, trashed_path)
+
+    records = _load_trash_records(file_path.parent)
+    records.append(
+        {
+            "trashed_name": trashed_path.name,
+            "original_path": str(file_path),
+            "deleted_at": dt.datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    _save_trash_records(file_path.parent, records)
+    return trashed_path
+
+
+def load_trashed_events(event_dir: Path) -> list[TrashedEvent]:
+    entries: list[TrashedEvent] = []
+    for record in _load_trash_records(event_dir):
+        trashed_name = str(record.get("trashed_name") or "")
+        original_text = str(record.get("original_path") or "")
+        if not trashed_name or not original_text:
+            continue
+        trashed_path = event_trash_dir(event_dir) / Path(trashed_name).name
+        event = parse_ics_file(trashed_path)
+        if event is None:
+            continue
+        try:
+            deleted_at = dt.datetime.fromisoformat(str(record.get("deleted_at") or ""))
+        except ValueError:
+            deleted_at = dt.datetime.fromtimestamp(trashed_path.stat().st_mtime)
+        entries.append(TrashedEvent(event=event, original_path=Path(original_text), deleted_at=deleted_at))
+    return sorted(entries, key=lambda entry: entry.deleted_at, reverse=True)
+
+
+def restore_trashed_event(event_dir: Path, trashed_path: Path) -> Path | None:
+    records = _load_trash_records(event_dir)
+    record = _trash_record_for_path(records, trashed_path)
+    if record is None or not trashed_path.exists():
+        return None
+
+    original_path = Path(str(record["original_path"]))
+    try:
+        original_path.resolve().relative_to(event_dir.resolve())
+    except ValueError:
+        original_path = event_dir / original_path.name
+    destination = _available_restore_path(original_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    trashed_path.replace(destination)
+    move_event_completion(trashed_path, destination)
+    _save_trash_records(event_dir, [item for item in records if item is not record])
+    return destination
+
+
+def permanently_delete_trashed_event(event_dir: Path, trashed_path: Path) -> bool:
+    records = _load_trash_records(event_dir)
+    record = _trash_record_for_path(records, trashed_path)
+    if record is None:
+        return False
+    try:
+        trashed_path.unlink()
+    except FileNotFoundError:
+        pass
+    clear_event_completion(trashed_path)
+    _save_trash_records(event_dir, [item for item in records if item is not record])
+    return True
+
+
+def _trash_index_path(event_dir: Path) -> Path:
+    return event_trash_dir(event_dir) / "index.json"
+
+
+def _load_trash_records(event_dir: Path) -> list[dict[str, str]]:
+    index_path = _trash_index_path(event_dir)
+    if not index_path.exists():
+        return []
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def _save_trash_records(event_dir: Path, records: list[dict[str, str]]) -> None:
+    index_path = _trash_index_path(event_dir)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = index_path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_path.replace(index_path)
+
+
+def _trash_record_for_path(records: list[dict[str, str]], trashed_path: Path) -> dict[str, str] | None:
+    for record in records:
+        if str(record.get("trashed_name") or "") == trashed_path.name:
+            return record
+    return None
+
+
+def _available_restore_path(original_path: Path) -> Path:
+    if not original_path.exists():
+        return original_path
+    index = 2
+    while True:
+        candidate = original_path.with_name(f"{original_path.stem} ({index}){original_path.suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
 
 
 def parse_ics_file(path: Path) -> CalendarEvent | None:
