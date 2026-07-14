@@ -4,6 +4,8 @@ import calendar as pycalendar
 import datetime as dt
 import json
 import os
+import random
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -64,7 +66,6 @@ from coolcalendar.services.ai import (
     OpenAIMessageAnalyzer,
     create_ai_event_from_analysis,
     default_analysis_store_path,
-    format_analysis_for_display,
     resolved_api_key,
     sanitize_model_name,
 )
@@ -91,14 +92,17 @@ from coolcalendar.services.google_calendar import (
     GoogleCalendarSyncError,
     connect_google_calendar,
     delete_synced_event,
+    flush_pending_deletions,
     google_calendar_ready,
     import_events,
     move_sync_mapping,
+    move_sync_mapping_to_trash,
+    pending_sync_events,
+    restore_sync_mapping,
     sync_event_path,
 )
 from coolcalendar.services.messages import (
     MessageService,
-    build_event_description,
     guess_event_date,
     guess_event_time,
     summarize_message,
@@ -110,6 +114,54 @@ def shorten_text(value: str, limit: int = 96) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 1].rstrip() + "..."
+
+
+def event_description_sections(value: str) -> tuple[str, str]:
+    """Split an AI-authored event note into a concise summary and readable source text."""
+    lines = [line.strip() for line in (value or "").splitlines()]
+    summary = ""
+    original_start: int | None = None
+    for index, line in enumerate(lines):
+        if line.startswith(("요약:", "요약：")):
+            summary = line.split(":" if ":" in line else "：", 1)[1].strip()
+        if line in {"[원본 메시지]", "[원문 메시지]"}:
+            original_start = index + 1
+
+    if original_start is not None:
+        detail = "\n".join(line for line in lines[original_start:] if line).strip()
+    elif summary:
+        detail = "\n".join(
+            line
+            for line in lines
+            if line and line not in {"[AI 자동 정리]", "[AI 자동정리]"} and not line.startswith(("요약:", "요약："))
+        ).strip()
+    else:
+        detail = (value or "").strip()
+    return summary, detail
+
+
+def unfinished_events_first(events: list[CalendarEvent]) -> list[CalendarEvent]:
+    """Keep the source order within each state while prioritizing unfinished work."""
+    return sorted(events, key=lambda event: event.completed)
+
+
+def highlighted_text(value: str, query: str) -> str:
+    """Return safe rich text with unobtrusive search-term highlighting."""
+    text = value or ""
+    if not query:
+        return html_escape(text)
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    parts: list[str] = []
+    cursor = 0
+    for match in pattern.finditer(text):
+        parts.append(html_escape(text[cursor : match.start()]))
+        parts.append(
+            "<span style='background-color:#fff0b8;color:#5c4600;'>"
+            f"{html_escape(match.group(0))}</span>"
+        )
+        cursor = match.end()
+    parts.append(html_escape(text[cursor:]))
+    return "".join(parts)
 
 
 def apply_shadow(widget: QWidget, *, blur: int = 32, alpha: int = 70, y_offset: int = 10) -> None:
@@ -596,53 +648,35 @@ class StatTile(QFrame):
 
 
 class MessageCardWidget(QFrame):
-    def __init__(self, message: Message) -> None:
+    def __init__(self, message: Message, *, analysis: MessageAnalysis | None = None, query: str = "") -> None:
         super().__init__()
         self.setObjectName("messageCard")
         self.setProperty("selected", False)
         self.setProperty("dragging", False)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
-        suggested_date = guess_event_date(message)
-        suggested_time = guess_event_time(message) or "시간 미정"
-        headline = message.peer or ("보낸 메시지" if message.direction == "send" else "받은 메시지")
-        preview = shorten_text(message.preview or summarize_message(message) or "(내용 없음)", 72)
+        title = shorten_text(message.title.strip() or shorten_text(message.body, 54) or "제목 없는 메시지", 72)
+        ai_summary = shorten_text(analysis.summary, 72) if analysis is not None and analysis.summary else ""
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setContentsMargins(14, 11, 14, 11)
         layout.setSpacing(6)
 
-        top = QHBoxLayout()
-        top.setSpacing(10)
-        layout.addLayout(top)
+        self.title_label = QLabel()
+        self.title_label.setObjectName("messageTitle")
+        self.title_label.setTextFormat(Qt.RichText)
+        self.title_label.setText(highlighted_text(title, query))
+        self.title_label.setWordWrap(True)
+        layout.addWidget(self.title_label)
 
-        self.headline_label = QLabel(headline)
-        self.headline_label.setObjectName("cardTitle")
-        self.headline_label.setWordWrap(False)
-        top.addWidget(self.headline_label, 1)
-
-        self.time_label = QLabel(message.when_text or "시간 없음")
-        self.time_label.setObjectName("cardMetaPill")
-        top.addWidget(self.time_label)
-
-        self.preview_label = QLabel(preview)
-        self.preview_label.setObjectName("cardBody")
-        self.preview_label.setWordWrap(False)
-        self.preview_label.setTextInteractionFlags(Qt.NoTextInteraction)
-        layout.addWidget(self.preview_label)
-
-        bottom = QHBoxLayout()
-        bottom.setSpacing(6)
-        layout.addLayout(bottom)
-
-        self.date_hint = QLabel(f"{suggested_date.month:02d}/{suggested_date.day:02d}")
-        self.date_hint.setObjectName("softChip")
-        bottom.addWidget(self.date_hint)
-
-        self.time_hint = QLabel(suggested_time)
-        self.time_hint.setObjectName("softChip")
-        bottom.addWidget(self.time_hint)
-        bottom.addStretch(1)
+        if ai_summary:
+            self.summary_label = QLabel()
+            self.summary_label.setObjectName("messageSummary")
+            self.summary_label.setTextFormat(Qt.RichText)
+            self.summary_label.setText(highlighted_text(ai_summary, query))
+            self.summary_label.setWordWrap(True)
+            self.summary_label.setTextInteractionFlags(Qt.NoTextInteraction)
+            layout.addWidget(self.summary_label)
 
     def set_selected(self, selected: bool) -> None:
         self.setProperty("selected", selected)
@@ -657,22 +691,24 @@ class EventCardWidget(QFrame):
         self.setProperty("selected", False)
         self.setProperty("completed", event.completed)
 
-        description = shorten_text(event.description.replace("\n", " "), 88)
-        time_text = event.time_text or "종일"
+        ai_summary, detail = event_description_sections(event.description)
+        description = shorten_text(ai_summary or detail, 82)
+        status_text = "완료" if event.completed else (event.time_text or "종일")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(7)
 
         top = QHBoxLayout()
         top.setSpacing(10)
         layout.addLayout(top)
 
-        self.time_label = QLabel(time_text)
-        self.time_label.setObjectName("timeBadge")
-        top.addWidget(self.time_label)
+        self.status_label = QLabel(status_text)
+        self.status_label.setObjectName("eventStatusBadge")
+        self.status_label.setProperty("completed", event.completed)
+        top.addWidget(self.status_label)
 
-        self.title_label = QLabel(f"✓ {event.title}" if event.completed else event.title)
+        self.title_label = QLabel(event.title)
         self.title_label.setObjectName("cardTitle")
         self.title_label.setWordWrap(True)
         top.addWidget(self.title_label, 1)
@@ -681,10 +717,6 @@ class EventCardWidget(QFrame):
         self.body_label.setObjectName("cardBody")
         self.body_label.setWordWrap(True)
         layout.addWidget(self.body_label)
-
-        self.file_label = QLabel(event.file_path.name)
-        self.file_label.setObjectName("cardSubBody")
-        layout.addWidget(self.file_label)
 
     def set_selected(self, selected: bool) -> None:
         self.setProperty("selected", selected)
@@ -977,7 +1009,7 @@ class DayEventManagerDialog(ChromeDialog):
         if current_path is None and self.event_list.currentItem() is not None:
             current_path = Path(str(self.event_list.currentItem().data(Qt.UserRole)))
 
-        events = self.event_provider(self.event_date)
+        events = unfinished_events_first(self.event_provider(self.event_date))
         self.dialog_title_label.setText(f"{self.event_date.strftime('%Y.%m.%d')} 일정 관리")
         self.date_chip.setText(self.event_date.strftime("%Y년 %m월 %d일"))
         self.count_chip.setText(f"일정 {len(events)}건")
@@ -1393,6 +1425,265 @@ class OverlaySettingsDialog(ChromeDialog):
         super().reject()
 
 
+class PixelAnimalWidget(QWidget):
+    """One of several crisp pixel animals, chosen once per waiting task."""
+
+    ANIMALS = {
+        "cat": "고양이",
+        "dog": "강아지",
+        "rabbit": "토끼",
+        "duck": "오리",
+    }
+
+    PALETTES = {
+        "cat": ("#f4a340", "#d97706", "#fff2d8", "#f472b6"),
+        "dog": ("#b7794b", "#75452b", "#f6dec5", "#3182f6"),
+        "rabbit": ("#b8a9f4", "#7968c6", "#fffaff", "#f08faf"),
+        "duck": ("#f6c94c", "#d79b24", "#fff5c7", "#f28b30"),
+    }
+
+    def __init__(self, animal_key: str | None = None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.animal_key = animal_key if animal_key in self.ANIMALS else random.choice(tuple(self.ANIMALS))
+        self.animal_name = self.ANIMALS[self.animal_key]
+        self._frame = 0
+        self.setFixedSize(132, 84)
+        self._timer = QTimer(self)
+        self._timer.setInterval(150)
+        self._timer.timeout.connect(self._advance)
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def _advance(self) -> None:
+        self._frame = (self._frame + 1) % 4
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+
+        pixel = 6
+        origin_x = 12
+        origin_y = 4 + (1 if self._frame in (1, 3) else 0)
+        primary, shade, light, accent = (QColor(value) for value in self.PALETTES[self.animal_key])
+        ink = QColor("#191f28")
+        ground = QColor("#d7e9ff")
+
+        def block(x: int, y: int, color: QColor, width: int = 1, height: int = 1) -> None:
+            painter.fillRect(origin_x + x * pixel, origin_y + y * pixel, width * pixel, height * pixel, color)
+
+        if self.animal_key == "cat":
+            self._paint_cat(block, primary, shade, light, accent, ink)
+        elif self.animal_key == "dog":
+            self._paint_dog(block, primary, shade, light, accent, ink)
+        elif self.animal_key == "rabbit":
+            self._paint_rabbit(block, primary, shade, light, accent, ink)
+        else:
+            self._paint_duck(block, primary, shade, light, accent, ink)
+
+        ground_shift = self._frame % 2
+        block(1 - ground_shift, 11, ground, 5, 1)
+        block(9 - ground_shift, 11, ground, 6, 1)
+        painter.end()
+
+    def _walking_legs(self, block, shade: QColor, *, y: int = 8) -> None:
+        if self._frame in (0, 2):
+            paws = ((5, y), (6, y + 1), (10, y), (9, y + 1))
+        else:
+            paws = ((5, y), (4, y + 1), (10, y), (11, y + 1))
+        for x, leg_y in paws:
+            block(x, leg_y, shade)
+
+    def _paint_cat(self, block, primary: QColor, shade: QColor, light: QColor, accent: QColor, ink: QColor) -> None:
+        tails = (
+            ((3, 6), (2, 5), (1, 4), (1, 3)),
+            ((3, 6), (2, 6), (1, 5), (1, 4)),
+            ((3, 6), (2, 7), (1, 7), (0, 6)),
+            ((3, 6), (2, 5), (1, 5), (0, 4)),
+        )
+        for x, y in tails[self._frame]:
+            block(x, y, shade)
+        block(4, 5, primary, 8, 3)
+        block(5, 4, primary, 5, 1)
+        block(10, 3, primary, 5, 4)
+        block(10, 1, shade)
+        block(14, 1, shade)
+        block(10, 2, primary, 2, 1)
+        block(13, 2, primary, 2, 1)
+        block(13, 4, ink)
+        block(13, 5, light, 2, 1)
+        block(15, 5, accent)
+        block(7, 7, light, 3, 1)
+        self._walking_legs(block, shade)
+
+    def _paint_dog(self, block, primary: QColor, shade: QColor, light: QColor, accent: QColor, ink: QColor) -> None:
+        tail_y = (4, 5, 6, 4)[self._frame]
+        block(3, 5, shade)
+        block(2, tail_y, shade)
+        block(1, max(2, tail_y - 1), shade)
+        block(4, 5, primary, 8, 3)
+        block(5, 4, primary, 5, 1)
+        block(10, 3, primary, 5, 4)
+        block(10, 2, shade, 2, 3)
+        block(13, 4, ink)
+        block(13, 5, light, 3, 2)
+        block(15, 5, ink)
+        block(11, 6, accent, 3, 1)
+        self._walking_legs(block, shade)
+
+    def _paint_rabbit(self, block, primary: QColor, shade: QColor, light: QColor, accent: QColor, ink: QColor) -> None:
+        ear_shift = 1 if self._frame == 2 else 0
+        block(10, ear_shift, primary, 2, 4)
+        block(13, 0, primary, 2, 4)
+        block(11, 1 + ear_shift, accent, 1, 2)
+        block(13, 1, accent, 1, 2)
+        block(4, 6, primary, 8, 3)
+        block(5, 5, primary, 5, 1)
+        block(10, 4, primary, 5, 4)
+        block(3, 6, light, 2, 2)
+        block(13, 5, ink)
+        block(14, 6, light)
+        block(15, 6, accent)
+        if self._frame in (0, 2):
+            block(5, 9, shade, 3, 1)
+            block(10, 9, shade, 3, 1)
+        else:
+            block(4, 9, shade, 3, 1)
+            block(11, 9, shade, 3, 1)
+
+    def _paint_duck(self, block, primary: QColor, shade: QColor, light: QColor, accent: QColor, ink: QColor) -> None:
+        block(3, 6, shade)
+        block(4, 6, primary, 8, 3)
+        block(5, 5, primary, 5, 1)
+        block(10, 3, primary, 5, 4)
+        block(13, 4, ink)
+        block(14, 5, accent, 3, 1)
+        block(6, 7, shade, 4, 1)
+        block(7, 6, light, 2, 1)
+        foot_shift = -1 if self._frame in (1, 3) else 0
+        block(6, 9, accent)
+        block(5 + foot_shift, 10, accent, 3, 1)
+        block(10, 9, accent)
+        block(9 - foot_shift, 10, accent, 3, 1)
+
+
+class BusyOverlayDialog(QDialog):
+    """Modal in-app waiting surface that leaves animation responsive during worker tasks."""
+
+    def __init__(self, title: str, message: str, *, parent: QWidget) -> None:
+        super().__init__(parent)
+        self._allow_close = False
+        self._dot_frame = 0
+        self._base_message = message.rstrip(". ")
+        self.setObjectName("busyOverlayDialog")
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addStretch(1)
+
+        center_row = QHBoxLayout()
+        center_row.addStretch(1)
+        outer.addLayout(center_row)
+
+        shell = QFrame()
+        shell.setObjectName("busyShell")
+        shell.setFixedWidth(390)
+        apply_shadow(shell, blur=42, alpha=86, y_offset=14)
+        center_row.addWidget(shell)
+        center_row.addStretch(1)
+
+        layout = QVBoxLayout(shell)
+        layout.setContentsMargins(30, 24, 30, 24)
+        layout.setSpacing(9)
+
+        self.animal = PixelAnimalWidget()
+        layout.addWidget(self.animal, 0, Qt.AlignHCenter)
+
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("busyTitle")
+        self.title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.title_label)
+
+        self.message_label = QLabel("")
+        self.message_label.setObjectName("busyMessage")
+        self.message_label.setAlignment(Qt.AlignCenter)
+        self.message_label.setWordWrap(True)
+        layout.addWidget(self.message_label)
+
+        hint = QLabel(f"{self.animal.animal_name}도 함께 기다리고 있어요. 끝나면 바로 알려드릴게요.")
+        hint.setObjectName("busyHint")
+        hint.setAlignment(Qt.AlignCenter)
+        layout.addWidget(hint)
+
+        outer.addStretch(1)
+
+        self._dots_timer = QTimer(self)
+        self._dots_timer.setInterval(420)
+        self._dots_timer.timeout.connect(self._update_dots)
+        self._update_dots()
+
+    def set_message(self, message: str) -> None:
+        self._base_message = str(message).rstrip(". ")
+        self._dot_frame = 0
+        self._update_dots()
+
+    def start(self) -> None:
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.frameGeometry())
+        self.animal.start()
+        self._dots_timer.start()
+        self.show()
+        self.raise_()
+
+    def finish(self) -> None:
+        self.animal.stop()
+        self._dots_timer.stop()
+        self._allow_close = True
+        self.accept()
+
+    def reject(self) -> None:  # type: ignore[override]
+        if self._allow_close:
+            super().reject()
+
+    def _update_dots(self) -> None:
+        self._dot_frame = (self._dot_frame + 1) % 4
+        self.message_label.setText(f"{self._base_message}{'.' * self._dot_frame}")
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._allow_close:
+            super().closeEvent(event)
+        else:
+            event.ignore()
+
+
+class BackgroundTaskWorker(QThread):
+    progress_changed = Signal(str)
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, task: Callable[[Callable[[str], None]], object], *, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.task = task
+
+    def run(self) -> None:  # type: ignore[override]
+        try:
+            result = self.task(self.progress_changed.emit)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
 class AIAnalysisWorker(QThread):
     item_processed = Signal(object, object, object)
     batch_finished = Signal(object, int, int)
@@ -1610,7 +1901,7 @@ class EventTodoDialog(ChromeDialog):
 
     def _refresh(self) -> None:
         self.event_list.clear()
-        for event in self.event_provider(self.event_date):
+        for event in unfinished_events_first(self.event_provider(self.event_date)):
             item = QListWidgetItem()
             row = EventTodoRowWidget(event, on_toggle=self._toggle_event)
             item.setSizeHint(QSize(0, max(48, row.sizeHint().height() + 4)))
@@ -1988,9 +2279,10 @@ class CalendarBoardWidget(QWidget):
         if not events:
             return ""
 
+        display_events = unfinished_events_first(events)
         lines: list[str] = []
         if is_main_surface:
-            for event in events[:1]:
+            for event in display_events[:1]:
                 badge_color = "#8a98a8" if event.completed else ("#1769e0" if event.all_day else "#0891b2")
                 title = html_escape(shorten_text(event.title, 18))
                 lines.append(
@@ -2010,7 +2302,7 @@ class CalendarBoardWidget(QWidget):
         time_size = f"{9.5 * scale:.1f}pt"
         title_size = f"{10.5 * scale:.1f}pt"
         more_size = f"{9 * scale:.1f}pt"
-        for event in events[:2]:
+        for event in display_events[:2]:
             badge_color = palette["ev_more"] if event.completed else (palette["ev_allday"] if event.all_day else palette["ev_timed"])
             time_label = "종일" if event.all_day else event.time_text
             title = html_escape(shorten_text(event.title, 14))
@@ -2053,7 +2345,7 @@ class CalendarBoardWidget(QWidget):
                 weekend=index % 7 in (0, 6),
             )
 
-        selected_events = self.events_by_date.get(self.selected_date, [])
+        selected_events = unfinished_events_first(self.events_by_date.get(self.selected_date, []))
         if selected_events:
             summary = "   ".join(f"{idx + 1}. {event.title}" for idx, event in enumerate(selected_events[:4]))
             if len(selected_events) > 4:
@@ -2264,11 +2556,14 @@ class MainWindow(QMainWindow):
         self.messages_by_key: dict[int, Message] = {}
         self._all_messages: list[Message] = []
         self._message_search_index: dict[int, str] = {}
+        self._message_filter_mode = "all"
         self.analysis_store = AIAnalysisStore(default_analysis_store_path(config.db_path))
         self.message_analyses: dict[int, MessageAnalysis] = self.analysis_store.values()
         self.events_by_date: dict[dt.date, list[CalendarEvent]] = {}
         self.overlay_window: OverlayBoardWindow | None = None
         self.ai_worker: AIAnalysisWorker | None = None
+        self.background_worker: BackgroundTaskWorker | None = None
+        self.busy_overlay: BusyOverlayDialog | None = None
         self.ai_pending_count = 0
         self.ai_last_created_paths: list[Path] = []
         self.ai_confirm_queue: list[int] = []
@@ -2338,65 +2633,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 14)
         layout.setSpacing(12)
 
-        self.hero = QFrame()
-        self.hero.setObjectName("topToolbar")
-        apply_shadow(self.hero, blur=22, alpha=18, y_offset=5)
-        hero_layout = QVBoxLayout(self.hero)
-        hero_layout.setContentsMargins(12, 10, 12, 10)
-        hero_layout.setSpacing(0)
-
-        hero_top = QHBoxLayout()
-        hero_top.setSpacing(16)
-        hero_layout.addLayout(hero_top)
-
         self.ai_chip = QLabel("")
         self.ai_chip.setVisible(False)
-
-        hero_top.addStretch(1)
-
-        action_box = QHBoxLayout()
-        action_box.setSpacing(8)
-        hero_top.addLayout(action_box)
-        action_box.addWidget(
-            self._make_button("새 일정", self.create_event_for_current_date, tooltip="선택한 날짜에 새 일정을 추가합니다.")
-        )
-        action_box.addWidget(
-            self._make_button(
-                "오버레이 보드",
-                self.toggle_overlay,
-                variant="secondary",
-                tooltip="바탕화면 위에 월간 캘린더 보드를 띄웁니다.",
-            )
-        )
-        action_box.addWidget(
-            self._make_button(
-                "새로고침", self._load_all, variant="ghost", tooltip="메시지와 일정을 지금 다시 불러옵니다."
-            )
-        )
-        action_box.addWidget(
-            self._make_button(
-                "재시작", self.restart_application, variant="ghost", tooltip="저장된 설정으로 앱을 다시 시작합니다."
-            )
-        )
-
-        tools_button = QToolButton()
-        tools_button.setText("설정 및 동기화")
-        tools_button.setProperty("variant", "secondary")
-        tools_button.setPopupMode(QToolButton.InstantPopup)
-        tools_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        tools_button.setToolTip("AI, Google Calendar, 저장 위치와 화면 설정을 엽니다.")
-        tools_menu = QMenu(tools_button)
-        tools_menu.addAction("AI 설정", self.open_ai_settings)
-        tools_menu.addAction("Google Calendar 설정", self.open_google_calendar_settings)
-        tools_menu.addAction("Google Calendar 동기화", self.import_google_calendar_events)
-        tools_menu.addSeparator()
-        tools_menu.addAction("DB 변경", self.change_db_path)
-        tools_menu.addAction("일정 폴더 변경", self.change_event_dir)
-        tools_menu.addAction("일정 폴더 열기", self.open_event_dir)
-        tools_menu.addSeparator()
-        tools_menu.addAction("화면 맞춤", self.fit_current_windows_to_screen)
-        tools_button.setMenu(tools_menu)
-        action_box.addWidget(tools_button)
 
         self.today_tile = StatTile("오늘")
         self.message_tile = StatTile("메시지")
@@ -2409,8 +2647,6 @@ class MainWindow(QMainWindow):
         self.dir_chip = QLabel("")
         self.dir_chip.setObjectName("statusChip")
 
-        layout.addWidget(self.hero)
-
         splitter = QSplitter()
         splitter.setChildrenCollapsible(False)
         layout.addWidget(splitter, 1)
@@ -2421,36 +2657,88 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(self.left_panel)
         left_layout.setContentsMargins(16, 16, 16, 16)
         left_layout.setSpacing(10)
-        left_layout.addWidget(self._section_title("메시지 인박스", "카드형 리스트에서 메시지를 고르고 바로 달력에 넣을 수 있습니다."))
+        left_layout.addWidget(self._section_title("메시지", "필요한 내용을 빠르게 찾고, 읽고, 일정으로 연결하세요."))
+
+        search_shell = QFrame()
+        search_shell.setObjectName("messageSearchShell")
+        search_layout = QHBoxLayout(search_shell)
+        search_layout.setContentsMargins(10, 7, 10, 7)
+        search_layout.setSpacing(8)
 
         self.message_search = QLineEdit()
         self.message_search.setObjectName("searchField")
-        self.message_search.setPlaceholderText("메시지 검색  (보낸 사람 · 제목 · 내용)")
+        self.message_search.setPlaceholderText("보낸 사람, 제목, 내용 검색")
         self.message_search.setClearButtonEnabled(True)
         self.message_search.textChanged.connect(self._schedule_message_render)
-        left_layout.addWidget(self.message_search)
+        search_layout.addWidget(self.message_search, 1)
+
+        self.message_result_count = QLabel("0개")
+        self.message_result_count.setObjectName("messageResultCount")
+        search_layout.addWidget(self.message_result_count)
+        left_layout.addWidget(search_shell)
+
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
+        left_layout.addLayout(filter_row)
+        self.message_filter_buttons: dict[str, QPushButton] = {}
+        for mode, text in (("all", "전체"), ("schedule", "일정 제안"), ("analyzed", "AI 분석"), ("attachment", "첨부")):
+            button = QPushButton(text)
+            button.setObjectName("messageFilterButton")
+            button.setCheckable(True)
+            button.setChecked(mode == "all")
+            button.clicked.connect(lambda _checked=False, selected_mode=mode: self._set_message_filter(selected_mode))
+            filter_row.addWidget(button)
+            self.message_filter_buttons[mode] = button
+        filter_row.addStretch(1)
+
+        message_splitter = QSplitter(Qt.Vertical)
+        message_splitter.setChildrenCollapsible(False)
+        message_splitter.setObjectName("messageSplitter")
+        left_layout.addWidget(message_splitter, 1)
 
         self.message_list = MessageListWidget()
+        self.message_list.setMinimumHeight(130)
         self.message_list.currentItemChanged.connect(self.on_message_selected)
         self.message_list.itemDoubleClicked.connect(lambda *_args: self.add_selected_message_to_current_date())
-        left_layout.addWidget(self.message_list, 5)
+        message_splitter.addWidget(self.message_list)
 
-        self.add_selected_btn = self._make_button("선택 메시지 일정 추가", self.add_selected_message_to_current_date)
+        reader = QFrame()
+        reader.setObjectName("messageReader")
+        reader.setMinimumHeight(230)
+        reader_layout = QVBoxLayout(reader)
+        reader_layout.setContentsMargins(14, 13, 14, 13)
+        reader_layout.setSpacing(10)
+
+        reader_header = QHBoxLayout()
+        reader_header.setSpacing(8)
+        reader_layout.addLayout(reader_header)
+        reader_title = QLabel("메시지 보기")
+        reader_title.setObjectName("messageReaderTitle")
+        reader_header.addWidget(reader_title)
+        self.message_reader_meta = QLabel("메시지를 선택하세요")
+        self.message_reader_meta.setObjectName("messageReaderMeta")
+        reader_header.addWidget(self.message_reader_meta, 1, Qt.AlignRight)
+
+        self.message_detail = QTextEdit()
+        self.message_detail.setObjectName("messageDetailPane")
+        self.message_detail.setReadOnly(True)
+        self.message_detail.setPlaceholderText("메시지를 선택하면 요약과 원문을 읽을 수 있습니다.")
+        reader_layout.addWidget(self.message_detail, 1)
+
+        self.add_selected_btn = self._make_button("일정에 추가", self.add_selected_message_to_current_date)
         self.add_selected_btn.setEnabled(False)
         action_row = QHBoxLayout()
         action_row.setSpacing(10)
         action_row.addWidget(self.add_selected_btn, 1)
 
-        self.ai_analyze_btn = self._make_button("AI 분석", self.analyze_selected_message, variant="secondary", tooltip="선택한 메시지에서 일정과 할 일을 분석합니다.")
+        self.ai_analyze_btn = self._make_button("AI로 분석", self.analyze_selected_message, variant="secondary", tooltip="선택한 메시지에서 일정과 할 일을 분석합니다.")
         self.ai_analyze_btn.setEnabled(False)
         action_row.addWidget(self.ai_analyze_btn, 1)
-        left_layout.addLayout(action_row)
-
-        self.message_detail = QTextEdit()
-        self.message_detail.setObjectName("detailPane")
-        self.message_detail.setReadOnly(True)
-        self.message_detail.setPlaceholderText("메시지를 선택하면 요약, 원문, 추천 일정 정보가 여기에 표시됩니다.")
-        left_layout.addWidget(self.message_detail, 2)
+        reader_layout.addLayout(action_row)
+        message_splitter.addWidget(reader)
+        message_splitter.setStretchFactor(0, 2)
+        message_splitter.setStretchFactor(1, 3)
+        message_splitter.setSizes([280, 460])
         splitter.addWidget(self.left_panel)
 
         self.right_panel = QFrame()
@@ -2459,8 +2747,16 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(16, 16, 16, 16)
         right_layout.setSpacing(10)
+
+        self.event_vertical_splitter = QSplitter(Qt.Vertical)
+        self.event_vertical_splitter.setObjectName("eventVerticalSplitter")
+        self.event_vertical_splitter.setChildrenCollapsible(False)
+        self.event_vertical_splitter.setHandleWidth(10)
+        right_layout.addWidget(self.event_vertical_splitter, 1)
+
         self.board_shell = QFrame()
         self.board_shell.setObjectName("boardShell")
+        self.board_shell.setMinimumHeight(250)
         board_shell_layout = QVBoxLayout(self.board_shell)
         board_shell_layout.setContentsMargins(0, 0, 0, 0)
         board_shell_layout.setSpacing(0)
@@ -2472,46 +2768,61 @@ class MainWindow(QMainWindow):
         self.board.message_dropped.connect(self.on_message_dropped)
         self.board.day_open_requested.connect(self.open_day_manager)
         board_shell_layout.addWidget(self.board)
-        right_layout.addWidget(self.board_shell, 8)
+        self.event_vertical_splitter.addWidget(self.board_shell)
 
-        event_toolbar = QHBoxLayout()
+        event_workspace = QFrame()
+        event_workspace.setObjectName("eventWorkspace")
+        event_workspace.setMinimumHeight(220)
+        event_workspace_layout = QVBoxLayout(event_workspace)
+        event_workspace_layout.setContentsMargins(0, 0, 0, 0)
+        event_workspace_layout.setSpacing(10)
+        self.event_vertical_splitter.addWidget(event_workspace)
+
+        event_toolbar_surface = QFrame()
+        event_toolbar_surface.setObjectName("eventToolbarSurface")
+        event_toolbar = QHBoxLayout(event_toolbar_surface)
+        event_toolbar.setContentsMargins(12, 8, 10, 8)
         event_toolbar.setSpacing(10)
-        right_layout.addLayout(event_toolbar)
+        event_workspace_layout.addWidget(event_toolbar_surface)
 
         self.selected_date_label = QLabel("")
         self.selected_date_label.setObjectName("selectionLabel")
         event_toolbar.addWidget(self.selected_date_label, 1)
 
         self.new_event_btn = self._make_button(
-            "새 일정", self.create_event_for_current_date, variant="secondary", tooltip="선택한 날짜에 새 일정을 추가합니다."
+            "+ 새 일정", self.create_event_for_current_date, variant="secondary", tooltip="선택한 날짜에 새 일정을 추가합니다."
         )
         event_toolbar.addWidget(self.new_event_btn)
 
         self.event_todo_btn = self._make_button(
-            "일정 체크", self.open_event_todo_for_current_date, variant="secondary", tooltip="선택한 날짜의 등록 일정을 체크리스트로 엽니다."
+            "체크리스트", self.open_event_todo_for_current_date, variant="ghost", tooltip="선택한 날짜의 일정을 체크리스트로 엽니다."
         )
         event_toolbar.addWidget(self.event_todo_btn)
 
-        self.event_trash_btn = self._make_button("휴지통", self.open_event_trash, variant="ghost", tooltip="삭제한 일정을 복원하거나 영구 삭제합니다.")
-        event_toolbar.addWidget(self.event_trash_btn)
-
-        self.edit_event_btn = self._make_button("수정", self.edit_current_event, variant="ghost", tooltip="선택한 일정을 수정합니다.")
-        self.edit_event_btn.setEnabled(False)
-        event_toolbar.addWidget(self.edit_event_btn)
-
-        self.open_event_btn = self._make_button("열기", self.open_current_event, variant="ghost", tooltip="일정 파일을 기본 프로그램으로 엽니다.")
-        self.open_event_btn.setEnabled(False)
-        event_toolbar.addWidget(self.open_event_btn)
-
-        self.delete_event_btn = self._make_button("휴지통", self.delete_current_event, variant="danger", tooltip="선택한 일정을 휴지통으로 이동합니다.")
-        self.delete_event_btn.setEnabled(False)
-        event_toolbar.addWidget(self.delete_event_btn)
+        event_more_button = QToolButton()
+        event_more_button.setText("더 보기")
+        event_more_button.setProperty("variant", "ghost")
+        event_more_button.setPopupMode(QToolButton.InstantPopup)
+        event_more_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        event_more_button.setToolTip("선택한 일정의 수정, 열기, 삭제 작업을 표시합니다.")
+        event_more_menu = QMenu(event_more_button)
+        self.edit_event_action = event_more_menu.addAction("일정 수정", self.edit_current_event)
+        self.open_event_action = event_more_menu.addAction("파일 열기", self.open_current_event)
+        self.delete_event_action = event_more_menu.addAction("휴지통으로 이동", self.delete_current_event)
+        event_more_menu.addSeparator()
+        event_more_menu.addAction("삭제된 일정 보기", self.open_event_trash)
+        for action in (self.edit_event_action, self.open_event_action, self.delete_event_action):
+            action.setEnabled(False)
+        event_more_button.setMenu(event_more_menu)
+        event_toolbar.addWidget(event_more_button)
 
         bottom = QSplitter(Qt.Horizontal)
         bottom.setChildrenCollapsible(False)
-        right_layout.addWidget(bottom, 2)
+        bottom.setHandleWidth(8)
+        event_workspace_layout.addWidget(bottom, 1)
 
         self.event_list = EventListWidget()
+        self.event_list.setMinimumWidth(280)
         self.event_list.currentItemChanged.connect(self.on_event_selected)
         self.event_list.itemDoubleClicked.connect(self.open_current_event)
         self.event_list.delete_requested.connect(self.delete_current_event)
@@ -2524,12 +2835,41 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.event_detail)
 
         splitter.addWidget(self.right_panel)
-        splitter.setSizes([480, 1060])
-        bottom.setSizes([360, 560])
+        splitter.setSizes([540, 1000])
+        bottom.setStretchFactor(0, 2)
+        bottom.setStretchFactor(1, 3)
+        bottom.setSizes([360, 640])
+        self.event_vertical_splitter.setStretchFactor(0, 3)
+        self.event_vertical_splitter.setStretchFactor(1, 2)
+        self.event_vertical_splitter.setSizes([500, 330])
 
         status = self.statusBar()
         status.addPermanentWidget(self.db_chip)
         status.addPermanentWidget(self.dir_chip)
+
+        self.app_menu_button = QToolButton()
+        self.app_menu_button.setObjectName("statusMenuButton")
+        self.app_menu_button.setText("앱 메뉴")
+        self.app_menu_button.setPopupMode(QToolButton.InstantPopup)
+        self.app_menu_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.app_menu_button.setFixedHeight(28)
+        self.app_menu_button.setToolTip("오버레이, 새로고침, 재시작과 설정을 엽니다.")
+        app_menu = QMenu(self.app_menu_button)
+        app_menu.addAction("오버레이 보드", self.toggle_overlay)
+        app_menu.addAction("새로고침", self._load_all)
+        app_menu.addAction("앱 재시작", self.restart_application)
+        app_menu.addSeparator()
+        app_menu.addAction("AI 설정", self.open_ai_settings)
+        app_menu.addAction("Google Calendar 설정", self.open_google_calendar_settings)
+        app_menu.addAction("Google Calendar 동기화", self.import_google_calendar_events)
+        app_menu.addSeparator()
+        app_menu.addAction("DB 변경", self.change_db_path)
+        app_menu.addAction("일정 폴더 변경", self.change_event_dir)
+        app_menu.addAction("일정 폴더 열기", self.open_event_dir)
+        app_menu.addSeparator()
+        app_menu.addAction("화면 맞춤", self.fit_current_windows_to_screen)
+        self.app_menu_button.setMenu(app_menu)
+        status.addPermanentWidget(self.app_menu_button)
         status.showMessage("준비됨")
 
         search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
@@ -2569,7 +2909,7 @@ class MainWindow(QMainWindow):
             QMainWindow, QWidget#rootSurface {
                 background: transparent;
                 color: #f3f7fb;
-                font-family: "Malgun Gothic", "Segoe UI";
+                font-family: "Hancom Gothic", "Malgun Gothic", "Segoe UI";
                 font-size: 10pt;
             }
             QFrame#heroCard, QFrame#panel, QFrame#boardShell, QFrame#overlayShell {
@@ -2641,7 +2981,7 @@ class MainWindow(QMainWindow):
             }
             QLabel#heroTitle {
                 color: #f6fbff;
-                font-family: "Malgun Gothic", "Segoe UI";
+                font-family: "Hancom Gothic", "Malgun Gothic", "Segoe UI";
                 font-size: 20pt;
                 font-weight: 700;
             }
@@ -2650,13 +2990,13 @@ class MainWindow(QMainWindow):
             }
             QLabel#sectionTitle, QLabel#boardTitle {
                 color: #f7fbff;
-                font-family: "Malgun Gothic", "Segoe UI";
+                font-family: "Hancom Gothic", "Malgun Gothic", "Segoe UI";
                 font-size: 15pt;
                 font-weight: 700;
             }
             QLabel#dialogTitle {
                 color: #f8fbff;
-                font-family: "Malgun Gothic", "Segoe UI";
+                font-family: "Hancom Gothic", "Malgun Gothic", "Segoe UI";
                 font-size: 18pt;
                 font-weight: 700;
             }
@@ -3025,9 +3365,32 @@ class MainWindow(QMainWindow):
             }
         """
         stylesheet += """
+            QDialog#busyOverlayDialog {
+                background: rgba(17, 24, 39, 0.26);
+            }
+            QDialog#busyOverlayDialog QFrame#busyShell {
+                background: #fbfcfe;
+                border: 1px solid rgba(60, 60, 67, 0.14);
+                border-radius: 24px;
+            }
+            QDialog#busyOverlayDialog QLabel#busyTitle {
+                color: #191f28;
+                font-size: 14pt;
+                font-weight: 600;
+            }
+            QDialog#busyOverlayDialog QLabel#busyMessage {
+                color: #4e5968;
+                font-size: 10pt;
+                min-height: 30px;
+            }
+            QDialog#busyOverlayDialog QLabel#busyHint {
+                color: #8b95a1;
+                font-size: 8.7pt;
+                margin-top: 3px;
+            }
             QWidget#rootSurface {
                 color: #1c1c1e;
-                font-family: "Segoe UI Variable", "Malgun Gothic", "Segoe UI";
+                font-family: "Hancom Gothic", "Malgun Gothic", "Segoe UI";
             }
             QWidget#rootSurface QFrame#heroCard,
             QWidget#rootSurface QFrame#panel,
@@ -3047,6 +3410,23 @@ class MainWindow(QMainWindow):
             QWidget#rootSurface QFrame#boardShell {
                 background: transparent;
                 border: none;
+            }
+            QWidget#rootSurface QFrame#eventToolbarSurface {
+                background: #f7f8fa;
+                border: 1px solid rgba(60, 60, 67, 0.09);
+                border-radius: 14px;
+            }
+            QWidget#rootSurface QFrame#eventWorkspace {
+                background: transparent;
+                border: none;
+            }
+            QWidget#rootSurface QSplitter#eventVerticalSplitter::handle:vertical {
+                background: #e5e8eb;
+                border-radius: 2px;
+                margin: 4px 42%;
+            }
+            QWidget#rootSurface QSplitter#eventVerticalSplitter::handle:vertical:hover {
+                background: #b8c8dc;
             }
             QWidget#rootSurface QLabel#heroEyebrow {
                 color: #3182f6;
@@ -3073,8 +3453,8 @@ class MainWindow(QMainWindow):
             }
             QWidget#rootSurface QLabel#selectionLabel {
                 color: #1c1c1e;
-                font-size: 11pt;
-                font-weight: 700;
+                font-size: 10.8pt;
+                font-weight: 600;
             }
             QWidget#rootSurface QFrame#statTile {
                 background: #f7f9fb;
@@ -3098,6 +3478,67 @@ class MainWindow(QMainWindow):
                 color: #4e5968;
                 padding: 9px 12px;
             }
+            QWidget#rootSurface QFrame#messageSearchShell {
+                background: #f2f2f7;
+                border: 1px solid rgba(60, 60, 67, 0.10);
+                border-radius: 13px;
+            }
+            QWidget#rootSurface QLabel#messageResultCount {
+                color: #6b7684;
+                font-size: 8.8pt;
+                font-weight: 700;
+                padding: 0 4px;
+            }
+            QWidget#rootSurface QPushButton#messageFilterButton {
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 9px;
+                color: #6b7684;
+                font-size: 8.8pt;
+                font-weight: 650;
+                padding: 5px 9px;
+            }
+            QWidget#rootSurface QPushButton#messageFilterButton:hover {
+                background: #f2f4f6;
+                color: #333d4b;
+            }
+            QWidget#rootSurface QPushButton#messageFilterButton:checked {
+                background: #eaf3ff;
+                border-color: rgba(0, 122, 255, 0.18);
+                color: #007aff;
+            }
+            QWidget#rootSurface QListWidget#messageList {
+                background: transparent;
+                border: none;
+                outline: none;
+                padding: 1px;
+            }
+            QWidget#rootSurface QListWidget#messageList::item {
+                background: transparent;
+                border: none;
+            }
+            QWidget#rootSurface QFrame#messageReader {
+                background: #ffffff;
+                border: 1px solid rgba(60, 60, 67, 0.10);
+                border-radius: 14px;
+            }
+            QWidget#rootSurface QLabel#messageReaderTitle {
+                color: #191f28;
+                font-size: 10.3pt;
+                font-weight: 600;
+            }
+            QWidget#rootSurface QLabel#messageReaderMeta {
+                color: #8b95a1;
+                font-size: 8.8pt;
+            }
+            QWidget#rootSurface QTextEdit#messageDetailPane {
+                background: #fbfbfd;
+                border: 1px solid rgba(60, 60, 67, 0.08);
+                border-radius: 11px;
+                color: #191f28;
+                padding: 12px;
+                selection-background-color: rgba(0, 122, 255, 0.18);
+            }
             QWidget#rootSurface QTextEdit#detailPane {
                 background: #f7f7fa;
                 border: 1px solid rgba(60, 60, 67, 0.10);
@@ -3117,18 +3558,27 @@ class MainWindow(QMainWindow):
                 background: #eaf3ff;
                 border: 1px solid rgba(0, 122, 255, 0.52);
             }
+            QWidget#rootSurface QFrame#messageCard:hover {
+                background: #f7faff;
+                border-color: rgba(0, 122, 255, 0.28);
+            }
+            QWidget#rootSurface QFrame#messageCard[selected="true"] {
+                background: #edf6ff;
+                border: 2px solid #007aff;
+            }
             QWidget#rootSurface QFrame#messageCard[dragging="true"] {
                 background: #eaf3ff;
                 border: 2px solid #007aff;
             }
             QWidget#rootSurface QFrame#eventCard[completed="true"] {
-                background: #f7f7fa;
+                background: #fafbfc;
                 border-color: rgba(60, 60, 67, 0.08);
             }
-            QWidget#rootSurface QFrame#eventCard[completed="true"] QLabel#cardTitle,
-            QWidget#rootSurface QFrame#eventCard[completed="true"] QLabel#cardBody,
-            QWidget#rootSurface QFrame#eventCard[completed="true"] QLabel#cardSubBody {
-                color: #8e8e93;
+            QWidget#rootSurface QFrame#eventCard[completed="true"] QLabel#cardTitle {
+                color: #4e5968;
+            }
+            QWidget#rootSurface QFrame#eventCard[completed="true"] QLabel#cardBody {
+                color: #7b8794;
             }
             QWidget#rootSurface QLabel#cardTitle {
                 color: #191f28;
@@ -3141,6 +3591,16 @@ class MainWindow(QMainWindow):
             }
             QWidget#rootSurface QLabel#cardSubBody {
                 color: #6b7684;
+            }
+            QWidget#rootSurface QLabel#messageTitle {
+                color: #191f28;
+                font-size: 10.4pt;
+                font-weight: 600;
+            }
+            QWidget#rootSurface QLabel#messageSummary {
+                color: #4e5968;
+                font-size: 9.6pt;
+                line-height: 150%;
             }
             QWidget#rootSurface QLabel#cardMetaPill,
             QWidget#rootSurface QLabel#softChip,
@@ -3158,6 +3618,20 @@ class MainWindow(QMainWindow):
                 background: #fff6db;
                 color: #b27800;
                 border-color: #ffe4a3;
+            }
+            QWidget#rootSurface QLabel#eventStatusBadge {
+                background: #eef6ff;
+                border: 1px solid #d7e9ff;
+                border-radius: 9px;
+                color: #1769e0;
+                font-size: 8.4pt;
+                font-weight: 600;
+                padding: 3px 7px;
+            }
+            QWidget#rootSurface QLabel#eventStatusBadge[completed="true"] {
+                background: #edf8f1;
+                border-color: #d8efe0;
+                color: #16834a;
             }
             QWidget#rootSurface QPushButton, QWidget#rootSurface QToolButton {
                 background: #007aff;
@@ -3300,16 +3774,16 @@ class MainWindow(QMainWindow):
                 font-weight: 800;
             }
             QWidget#rootSurface QLineEdit#searchField {
-                background: #f2f2f7;
-                border: 1px solid rgba(60, 60, 67, 0.10);
-                border-radius: 11px;
-                padding: 9px 12px;
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+                padding: 6px 7px;
                 color: #1c1c1e;
                 selection-background-color: rgba(0, 122, 255, 0.20);
             }
             QWidget#rootSurface QLineEdit#searchField:focus {
-                background: #ffffff;
-                border: 2px solid #007aff;
+                background: rgba(255, 255, 255, 0.78);
+                border: none;
             }
             QStatusBar {
                 background: #f7f9fb;
@@ -3317,6 +3791,22 @@ class MainWindow(QMainWindow):
             }
             QStatusBar::item {
                 border: none;
+            }
+            QStatusBar QToolButton#statusMenuButton {
+                background: #eef6ff;
+                border: 1px solid #d7e9ff;
+                border-radius: 8px;
+                color: #1769e0;
+                font-size: 8.8pt;
+                font-weight: 600;
+                padding: 3px 9px;
+            }
+            QStatusBar QToolButton#statusMenuButton:hover {
+                background: #e1f0ff;
+                border-color: #bddbff;
+            }
+            QStatusBar QToolButton#statusMenuButton:pressed {
+                background: #d7e9ff;
             }
             QMenu {
                 background: #ffffff;
@@ -3332,6 +3822,10 @@ class MainWindow(QMainWindow):
             QMenu::item:selected {
                 background: #eaf3ff;
                 color: #1769e0;
+            }
+            QMenu::item:disabled {
+                color: #b0b8c1;
+                background: transparent;
             }
             QMenu::separator {
                 height: 1px;
@@ -3600,6 +4094,11 @@ class MainWindow(QMainWindow):
     def _store_analysis(self, analysis: MessageAnalysis) -> None:
         self.message_analyses[analysis.message_key] = analysis
         self.analysis_store.upsert(analysis)
+        message = self.messages_by_key.get(analysis.message_key)
+        if message is not None:
+            self._message_search_index[message.key] = " ".join(
+                (message.peer or "", message.title or "", message.body or "", analysis.summary or "")
+            ).casefold()
 
     def _refresh_summary_tiles(self) -> None:
         today = dt.date.today()
@@ -3832,6 +4331,13 @@ class MainWindow(QMainWindow):
         self.ai_analyze_btn.setEnabled(False)
         self._update_ai_status_chip()
         self.statusBar().showMessage(f"AI 분석을 시작했습니다: {len(messages)}건")
+        if mode == "manual" and self.busy_overlay is None:
+            self.busy_overlay = BusyOverlayDialog(
+                "AI 메시지 분석",
+                "메시지를 읽고 핵심 내용을 정리하고 있어요",
+                parent=self,
+            )
+            self.busy_overlay.start()
         self.ai_worker.start()
 
     def _start_auto_ai_if_needed(self, messages: list[Message]) -> None:
@@ -3895,6 +4401,9 @@ class MainWindow(QMainWindow):
             self.on_message_selected()
 
     def _on_ai_batch_finished(self, mode: object, processed_count: int, created_count: int) -> None:
+        if mode == "manual":
+            self._close_busy_overlay()
+        self._render_message_list()
         if self.ai_last_created_paths:
             self._refresh_events(preferred_path=self.ai_last_created_paths[-1])
             self._sync_google_created_paths(self.ai_last_created_paths)
@@ -4001,7 +4510,14 @@ class MainWindow(QMainWindow):
     def populate_messages(self, messages: list[Message]) -> None:
         self._all_messages = messages
         self._message_search_index = {
-            message.key: " ".join((message.peer or "", message.title or "", message.body or "")).casefold()
+            message.key: " ".join(
+                (
+                    message.peer or "",
+                    message.title or "",
+                    message.body or "",
+                    (analysis.summary if (analysis := self._analysis_for_message(message.key)) is not None else ""),
+                )
+            ).casefold()
             for message in messages
         }
         self._message_search_timer.stop()
@@ -4010,14 +4526,33 @@ class MainWindow(QMainWindow):
     def _schedule_message_render(self, *_args) -> None:
         self._message_search_timer.start()
 
+    def _set_message_filter(self, mode: str) -> None:
+        self._message_filter_mode = mode
+        for key, button in self.message_filter_buttons.items():
+            button.setChecked(key == mode)
+        self._message_search_timer.stop()
+        self._render_message_list()
+
     def _filtered_messages(self) -> list[Message]:
         query = self.message_search.text().strip().casefold()
-        if not query:
-            return self._all_messages
-        return [message for message in self._all_messages if query in self._message_search_index.get(message.key, "")]
+        messages = self._all_messages
+        if query:
+            messages = [message for message in messages if query in self._message_search_index.get(message.key, "")]
+        if self._message_filter_mode == "schedule":
+            messages = [
+                message
+                for message in messages
+                if (analysis := self._analysis_for_message(message.key)) is not None and analysis.should_create_event
+            ]
+        elif self._message_filter_mode == "analyzed":
+            messages = [message for message in messages if self._analysis_for_message(message.key) is not None]
+        elif self._message_filter_mode == "attachment":
+            messages = [message for message in messages if message.file_path or message.link_url]
+        return messages
 
     def _render_message_list(self, *_args) -> None:
         messages = self._filtered_messages()
+        query = self.message_search.text().strip()
         current_key = None
         current_item = self.message_list.currentItem()
         if current_item is not None:
@@ -4030,8 +4565,10 @@ class MainWindow(QMainWindow):
             for message in messages:
                 item = QListWidgetItem()
                 item.setData(Qt.UserRole, message.key)
-                card = MessageCardWidget(message)
-                item.setSizeHint(QSize(0, max(92, card.sizeHint().height() + 6)))
+                analysis = self._analysis_for_message(message.key)
+                card = MessageCardWidget(message, analysis=analysis, query=query)
+                has_summary = analysis is not None and bool(analysis.summary.strip())
+                item.setSizeHint(QSize(0, 104 if has_summary else 64))
                 self.message_list.addItem(item)
                 self.message_list.setItemWidget(item, card)
                 if current_key == message.key:
@@ -4044,6 +4581,8 @@ class MainWindow(QMainWindow):
             self.message_list.setUpdatesEnabled(True)
 
         self._sync_item_widget_selection(self.message_list)
+        total = len(self._all_messages)
+        self.message_result_count.setText(f"{len(messages)}개" if len(messages) == total else f"{len(messages)} / {total}")
         self.on_message_selected()
         self._refresh_summary_tiles()
 
@@ -4053,18 +4592,18 @@ class MainWindow(QMainWindow):
             current_path = Path(str(self.event_list.currentItem().data(Qt.UserRole)))
 
         self.event_list.clear()
-        events = self.events_by_date.get(date, [])
+        events = unfinished_events_first(self.events_by_date.get(date, []))
         for event in events:
             item = QListWidgetItem()
             item.setData(Qt.UserRole, str(event.file_path))
             card = EventCardWidget(event)
-            item.setSizeHint(QSize(0, max(124, card.sizeHint().height() + 6)))
+            item.setSizeHint(QSize(0, 108))
             self.event_list.addItem(item)
             self.event_list.setItemWidget(item, card)
             if current_path is not None and event.file_path == current_path:
                 self.event_list.setCurrentItem(item)
 
-        self.selected_date_label.setText(f"{date.strftime('%Y.%m.%d')}  일정 {len(events)}건")
+        self.selected_date_label.setText(f"{date.year}년 {date.month}월 {date.day}일  ·  일정 {len(events)}개")
         self.add_selected_btn.setToolTip(f"{date.isoformat()} 날짜로 새 일정을 만듭니다.")
 
         if self.event_list.currentItem() is None and self.event_list.count():
@@ -4124,29 +4663,52 @@ class MainWindow(QMainWindow):
         self.add_selected_btn.setEnabled(message is not None)
         self.ai_analyze_btn.setEnabled(message is not None and self.ai_worker is None)
         if message is None:
+            self.message_reader_meta.setText("검색 결과가 없습니다" if self.message_list.count() == 0 else "메시지를 선택하세요")
             self.message_detail.clear()
             return
 
         suggested_date = guess_event_date(message)
         suggested_time = guess_event_time(message) or "시간 미정"
         analysis = self._analysis_for_message(message.key)
-        detail_lines = [
-            f"상대: {message.peer or '(이름 없음)'}",
-            f"원본 시각: {message.when_text}",
-            f"추천 일정 날짜: {suggested_date.isoformat()}",
-            f"추천 시간: {suggested_time}",
-            "",
-            "요약",
-            summarize_message(message),
-            "",
-            "일정 메모에 들어가는 내용",
-            build_event_description(message),
-        ]
-        if analysis is not None:
-            detail_lines.extend(["", "AI 분석", format_analysis_for_display(analysis)])
-        else:
-            detail_lines.extend(["", "AI 분석", "아직 분석 기록이 없습니다. '선택 메시지 AI 분석' 버튼으로 바로 분석할 수 있습니다."])
-        self.message_detail.setPlainText("\n".join(detail_lines))
+        sender = message.peer or "이름 없음"
+        title = message.title.strip() or "제목 없는 메시지"
+        summary = analysis.summary if analysis is not None and analysis.summary else summarize_message(message)
+        body = message.body.strip() or "내용이 없습니다."
+        direction = "보낸 메시지" if message.direction == "send" else "받은 메시지"
+        self.message_reader_meta.setText(f"{sender}  ·  {message.when_text or direction}")
+
+        schedule_html = ""
+        if analysis is not None and analysis.should_create_event:
+            due_text = " ".join(part for part in (analysis.due_date, analysis.due_time) if part).strip()
+            schedule_html = (
+                "<table width='100%' cellspacing='0' cellpadding='10' style='background:#eef6ff;border:1px solid #d7e9ff;'>"
+                "<tr><td><span style='color:#1769e0;font-weight:600;'>일정 제안</span><br>"
+                f"<span style='color:#191f28;font-weight:600;'>{html_escape(analysis.event_title or title)}</span><br>"
+                f"<span style='color:#4e5968;'>{html_escape(due_text or f'{suggested_date.isoformat()} {suggested_time}')}</span>"
+                "</td></tr></table><br>"
+            )
+
+        attachment_lines = []
+        if message.file_path:
+            attachment_lines.append(f"첨부 파일  {html_escape(message.file_path)}")
+        if message.link_url:
+            attachment_lines.append(f"링크  {html_escape(message.link_url)}")
+        attachment_html = "<br>".join(attachment_lines)
+        if attachment_html:
+            attachment_html = f"<br><span style='color:#6b7684;'>{attachment_html}</span>"
+
+        self.message_detail.setHtml(
+            "<div style=\"font-family:'Hancom Gothic','Malgun Gothic';color:#191f28;\">"
+            f"<div style='color:#6b7684;font-size:9.2pt;'>{html_escape(direction)} · {html_escape(sender)}</div>"
+            f"<h2 style='font-size:11.5pt;font-weight:600;line-height:1.42;margin:7px 0 13px 0;'>{html_escape(title)}</h2>"
+            f"{schedule_html}"
+            "<div style='color:#1769e0;font-size:9.2pt;font-weight:600;margin-bottom:6px;'>한눈에 보기</div>"
+            f"<div style='font-size:10.2pt;line-height:1.62;color:#333d4b;'>{html_escape(summary).replace(chr(10), '<br>')}</div>"
+            "<br><div style='color:#6b7684;font-size:9.2pt;font-weight:600;margin-bottom:6px;'>원문</div>"
+            f"<div style='font-size:10.2pt;line-height:1.70;color:#191f28;'>{html_escape(body).replace(chr(10), '<br>')}</div>"
+            f"{attachment_html}"
+            "</div>"
+        )
 
     def on_date_selected(self, date: dt.date) -> None:
         self.board.set_selected_date(date)
@@ -4186,15 +4748,39 @@ class MainWindow(QMainWindow):
         self._sync_item_widget_selection(self.event_list)
         event = self._current_event()
         has_event = event is not None
-        self.edit_event_btn.setEnabled(has_event)
-        self.open_event_btn.setEnabled(has_event)
-        self.delete_event_btn.setEnabled(has_event)
+        self.edit_event_action.setEnabled(has_event)
+        self.open_event_action.setEnabled(has_event)
+        self.delete_event_action.setEnabled(has_event)
         if event is None:
+            self.event_detail.setToolTip("")
             if self.event_list.count() == 0:
                 self.event_detail.setPlainText("선택한 날짜에 일정이 없습니다.")
             return
-        self.event_detail.setPlainText(
-            f"제목: {event.title}\n시간: {event.time_text or '종일'}\n파일: {event.file_path}\n\n{event.description}"
+
+        summary, detail = event_description_sections(event.description)
+        status_text = "완료" if event.completed else (event.time_text or "종일")
+        date_text = f"{event.date.year}년 {event.date.month}월 {event.date.day}일"
+        summary_html = ""
+        if summary:
+            summary_html = (
+                "<table width='100%' cellspacing='0' cellpadding='10' style='background:#eef6ff;border:1px solid #d7e9ff;'>"
+                "<tr><td><span style='color:#1769e0;font-size:9pt;font-weight:600;'>AI 요약</span><br>"
+                f"<span style='color:#333d4b;font-size:10pt;'>{html_escape(summary)}</span>"
+                "</td></tr></table><br>"
+            )
+        detail_label = "원문" if summary else "메모"
+        detail_text = html_escape(detail or "내용이 없습니다.").replace(chr(10), "<br>")
+        self.event_detail.setToolTip(str(event.file_path))
+        self.event_detail.setHtml(
+            "<div style=\"font-family:'Hancom Gothic','Malgun Gothic';color:#191f28;\">"
+            f"<div style='color:#6b7684;font-size:9pt;'>{html_escape(date_text)}  ·  {html_escape(status_text)}</div>"
+            f"<h2 style='font-size:12pt;font-weight:600;line-height:1.4;margin:7px 0 14px 0;'>{html_escape(event.title)}</h2>"
+            f"{summary_html}"
+            f"<div style='color:#6b7684;font-size:9pt;font-weight:600;margin-bottom:6px;'>{detail_label}</div>"
+            f"<div style='color:#333d4b;font-size:10pt;line-height:1.68;'>{detail_text}</div>"
+            "<br><br><div style='color:#8b95a1;font-size:8.6pt;'>파일  "
+            f"{html_escape(event.file_path.name)}</div>"
+            "</div>"
         )
 
     def _create_event_for_message(self, message: Message, date: dt.date) -> None:
@@ -4289,7 +4875,7 @@ class MainWindow(QMainWindow):
         trashed_path = move_event_to_trash(event.file_path)
         self._refresh_events()
         if trashed_path is not None:
-            move_sync_mapping(event.file_path, trashed_path)
+            move_sync_mapping_to_trash(event.file_path, trashed_path)
             self.statusBar().showMessage(f"휴지통으로 이동했습니다: {event.title}")
         else:
             show_info(self, "파일 없음", "해당 일정 파일을 찾지 못해 목록만 새로고침했습니다.")
@@ -4299,7 +4885,7 @@ class MainWindow(QMainWindow):
         if restored_path is None:
             show_info(self, "복원 실패", "휴지통에서 해당 일정을 찾지 못했습니다.")
             return False
-        move_sync_mapping(trashed_path, restored_path)
+        restore_sync_mapping(trashed_path, restored_path)
         self._refresh_events(preferred_path=restored_path)
         self.statusBar().showMessage(f"일정을 복원했습니다: {restored_path.name}")
         return True
@@ -4386,18 +4972,74 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Google Calendar 자동 등록을 껐습니다.")
             return
 
-        try:
+        def connect_task(progress: Callable[[str], None]) -> object:
+            progress("브라우저에서 Google 로그인을 완료해 주세요")
             connect_google_calendar(self.config)
-        except GoogleCalendarSyncError as exc:
-            show_warning(self, "Google Calendar 연결 실패", str(exc))
-            self.statusBar().showMessage("Google Calendar 연결에 실패했습니다.")
-            return
-        except Exception as exc:  # noqa: BLE001
-            show_warning(self, "Google Calendar 연결 실패", str(exc))
-            self.statusBar().showMessage("Google Calendar 연결에 실패했습니다.")
-            return
+            return None
 
-        self.statusBar().showMessage("Google Calendar 연결 완료. 새 일정부터 자동 등록합니다.")
+        def connected(_result: object) -> None:
+            self.statusBar().showMessage("Google Calendar 연결 완료. 새 일정부터 자동 등록합니다.")
+
+        def connection_failed(error: str) -> None:
+            show_warning(self, "Google Calendar 연결 실패", error)
+            self.statusBar().showMessage("Google Calendar 연결에 실패했습니다.")
+
+        self._start_background_task(
+            "Google Calendar 연결",
+            "안전하게 연결을 준비하고 있어요",
+            connect_task,
+            on_success=connected,
+            on_failure=connection_failed,
+        )
+
+    def _start_background_task(
+        self,
+        title: str,
+        message: str,
+        task: Callable[[Callable[[str], None]], object],
+        *,
+        on_success: Callable[[object], None],
+        on_failure: Callable[[str], None],
+    ) -> bool:
+        if self.background_worker is not None and self.background_worker.isRunning():
+            show_info(self, "작업 진행 중", "현재 작업이 끝난 뒤 다시 시도해 주세요.")
+            return False
+
+        overlay = BusyOverlayDialog(title, message, parent=self)
+        worker = BackgroundTaskWorker(task, parent=self)
+        self.busy_overlay = overlay
+        self.background_worker = worker
+
+        worker.progress_changed.connect(overlay.set_message)
+        worker.succeeded.connect(lambda result: self._handle_background_success(result, on_success))
+        worker.failed.connect(lambda error: self._handle_background_failure(error, on_failure))
+        worker.finished.connect(self._finish_background_task)
+
+        overlay.start()
+        QTimer.singleShot(0, worker.start)
+        return True
+
+    def _close_busy_overlay(self) -> None:
+        overlay = self.busy_overlay
+        self.busy_overlay = None
+        if overlay is not None:
+            overlay.finish()
+            overlay.deleteLater()
+
+    def _handle_background_success(self, result: object, callback: Callable[[object], None]) -> None:
+        self._close_busy_overlay()
+        callback(result)
+
+    def _handle_background_failure(self, error: str, callback: Callable[[str], None]) -> None:
+        self._close_busy_overlay()
+        callback(error)
+
+    def _finish_background_task(self) -> None:
+        worker = self.background_worker
+        self.background_worker = None
+        self._close_busy_overlay()
+        if worker is not None:
+            worker.deleteLater()
 
     def import_google_calendar_events(self) -> None:
         if not google_calendar_ready(self.config):
@@ -4417,17 +5059,10 @@ class MainWindow(QMainWindow):
         else:
             end_date = dt.date(start_date.year, start_date.month + 1, 1)
 
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.statusBar().showMessage("Google Calendar 동기화 중입니다...")
-        app = QApplication.instance()
-        if app is not None:
-            app.processEvents()
+        self._refresh_events()
 
-        try:
-            self._refresh_events()
-            self.statusBar().showMessage("Google Calendar 동기화 중: Google 일정을 가져옵니다...")
-            if app is not None:
-                app.processEvents()
+        def sync_task(progress: Callable[[str], None]) -> object:
+            progress("Google Calendar에서 일정을 가져오고 있어요")
             imported_paths = import_events(
                 self.config,
                 self.config.event_dir,
@@ -4435,32 +5070,58 @@ class MainWindow(QMainWindow):
                 end_date,
                 interactive=True,
             )
-            self._refresh_events(preferred_path=imported_paths[-1] if imported_paths else None)
-            self.statusBar().showMessage("Google Calendar 동기화 중: 로컬 일정을 업로드합니다...")
-            if app is not None:
-                app.processEvents()
-            uploaded_count = self._sync_google_events_in_range(start_date, end_date)
-        except GoogleCalendarSyncError as exc:
-            QApplication.restoreOverrideCursor()
-            show_warning(self, "Google Calendar 동기화 실패", str(exc))
-            return
-        except Exception as exc:  # noqa: BLE001
-            QApplication.restoreOverrideCursor()
-            show_warning(self, "Google Calendar 동기화 실패", str(exc))
-            return
-        finally:
-            while QApplication.overrideCursor() is not None:
-                QApplication.restoreOverrideCursor()
 
-        preferred_path = imported_paths[-1] if imported_paths else None
-        self._refresh_events(preferred_path=preferred_path)
-        message = (
-            f"{start_date.year}년 {start_date.month}월 Google 동기화 완료\n\n"
-            f"로컬 일정 업로드/업데이트: {uploaded_count}건\n"
-            f"Google 일정 가져오기/갱신: {len(imported_paths)}건"
+            progress("삭제한 일정을 Google Calendar에 반영하고 있어요")
+            deleted_count = flush_pending_deletions(self.config)
+
+            progress("변경된 로컬 일정을 확인하고 있어요")
+            current_events = load_events(self.config.event_dir)
+            upload_candidates: list[CalendarEvent] = []
+            seen_paths: set[Path] = set()
+            for event_date, events in current_events.items():
+                if not (start_date <= event_date < end_date):
+                    continue
+                for event in events:
+                    if event.file_path in seen_paths:
+                        continue
+                    seen_paths.add(event.file_path)
+                    upload_candidates.append(event)
+            upload_candidates = pending_sync_events(upload_candidates)
+
+            uploaded_count = 0
+            total_uploads = len(upload_candidates)
+            for index, event in enumerate(upload_candidates, start=1):
+                progress(f"로컬 일정을 Google에 보내고 있어요 · {index}/{total_uploads}")
+                if sync_event_path(self.config, current_events, event.file_path):
+                    uploaded_count += 1
+            return imported_paths, uploaded_count, deleted_count
+
+        def sync_succeeded(result: object) -> None:
+            imported_paths, uploaded_count, deleted_count = result  # type: ignore[misc]
+            preferred_path = imported_paths[-1] if imported_paths else None
+            self._refresh_events(preferred_path=preferred_path)
+            result_message = (
+                f"{start_date.year}년 {start_date.month}월 Google 동기화 완료\n\n"
+                f"로컬 일정 업로드/업데이트: {uploaded_count}건\n"
+                f"Google 일정 가져오기/갱신: {len(imported_paths)}건\n"
+                f"Google 일정 삭제 반영: {deleted_count}건"
+            )
+            self.statusBar().showMessage(result_message.replace("\n", " "))
+            show_info(self, "Google Calendar 동기화 완료", result_message)
+
+        def sync_failed(error: str) -> None:
+            self._refresh_events()
+            show_warning(self, "Google Calendar 동기화 실패", error)
+            self.statusBar().showMessage("Google Calendar 동기화에 실패했습니다.")
+
+        self.statusBar().showMessage("Google Calendar 동기화를 시작합니다...")
+        self._start_background_task(
+            "캘린더 동기화",
+            "Google Calendar와 일정을 맞추고 있어요",
+            sync_task,
+            on_success=sync_succeeded,
+            on_failure=sync_failed,
         )
-        self.statusBar().showMessage(message.replace("\n", " "))
-        show_info(self, "Google Calendar 동기화 완료", message)
 
     def analyze_selected_message(self) -> None:
         message = self._current_message()
@@ -4612,6 +5273,12 @@ class MainWindow(QMainWindow):
             app.quit()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self.background_worker is not None and self.background_worker.isRunning():
+            event.ignore()
+            if self.busy_overlay is not None:
+                self.busy_overlay.show()
+                self.busy_overlay.raise_()
+            return
         self.config.main_geometry = self._encode_geometry(self)
         if self.overlay_window is not None:
             self.config.overlay_geometry = self._encode_overlay_geometry(self.overlay_window)

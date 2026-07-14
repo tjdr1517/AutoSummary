@@ -2,6 +2,7 @@
 desktop_app/config.json
 desktop_app/google_token.json
 desktop_app/google_sync.json
+desktop_app/google_sync_state.json
 desktop_app/google_credentials.json
 
 # Generated and personal application data

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,10 @@ def _http_status(error: HttpError) -> int | None:
 
 def default_sync_map_path() -> Path:
     return Path(__file__).resolve().parents[2] / "google_sync.json"
+
+
+def default_sync_state_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "google_sync_state.json"
 
 
 def google_calendar_ready(config: AppConfig) -> bool:
@@ -74,11 +79,101 @@ def _save_sync_map(sync_map: dict[str, str], path: Path | None = None) -> None:
     map_path.write_text(json.dumps(sync_map, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _load_sync_state(path: Path | None = None) -> dict[str, dict[str, str]]:
+    state_path = path or default_sync_state_path()
+    empty = {"fingerprints": {}, "tokens": {}, "tombstones": {}}
+    if not state_path.exists():
+        return empty
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return empty
+    if not isinstance(payload, dict):
+        return empty
+    fingerprints = payload.get("fingerprints", {})
+    tokens = payload.get("tokens", {})
+    tombstones = payload.get("tombstones", {})
+    return {
+        "fingerprints": {
+            str(key): str(value) for key, value in fingerprints.items() if value
+        } if isinstance(fingerprints, dict) else {},
+        "tokens": {
+            str(key): str(value) for key, value in tokens.items() if value
+        } if isinstance(tokens, dict) else {},
+        "tombstones": {
+            str(key): str(value) for key, value in tombstones.items() if value
+        } if isinstance(tombstones, dict) else {},
+    }
+
+
+def _save_sync_state(state: dict[str, dict[str, str]], path: Path | None = None) -> None:
+    state_path = path or default_sync_state_path()
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "fingerprints": state.get("fingerprints", {}),
+                "tokens": state.get("tokens", {}),
+                "tombstones": state.get("tombstones", {}),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _event_fingerprint(event: CalendarEvent) -> str:
+    payload = {
+        "date": event.date.isoformat(),
+        "title": event.title,
+        "description": event.description,
+        "time_text": "" if event.all_day else event.time_text,
+        "all_day": event.all_day,
+        "end_date": event.end_date.isoformat() if event.end_date is not None else "",
+        "end_time_text": "" if event.all_day else event.end_time_text,
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _sync_scope_key(config: AppConfig, start_date: dt.date, end_date: dt.date) -> str:
+    calendar_id = config.google_calendar_id or "primary"
+    timezone = config.google_timezone or "Asia/Seoul"
+    return f"{calendar_id}|{timezone}|{start_date.isoformat()}|{end_date.isoformat()}"
+
+
+def pending_sync_events(events: list[CalendarEvent]) -> list[CalendarEvent]:
+    """Return only new or locally changed events without making a network request."""
+    sync_map = _load_sync_map()
+    fingerprints = _load_sync_state()["fingerprints"]
+    pending: list[CalendarEvent] = []
+    for event in events:
+        key = str(event.file_path)
+        if not sync_map.get(key) or fingerprints.get(key) != _event_fingerprint(event):
+            pending.append(event)
+    return pending
+
+
 def _path_for_google_event(sync_map: dict[str, str], google_event_id: str) -> Path | None:
     for path_text, stored_event_id in sync_map.items():
         if stored_event_id == google_event_id:
             return Path(path_text)
     return None
+
+
+def _google_event_id_from_ics(file_path: Path) -> str:
+    """Recover the remote id from an imported ICS if the local map is missing."""
+    try:
+        lines = file_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    suffix = "@google.calendar"
+    for line in lines:
+        if not line.startswith("UID:") or not line.endswith(suffix):
+            continue
+        return line[len("UID:") : -len(suffix)].strip()
+    return ""
 
 
 def _credentials(config: AppConfig, *, interactive: bool) -> Credentials:
@@ -168,8 +263,13 @@ def sync_event(config: AppConfig, event: CalendarEvent) -> str | None:
         return None
 
     sync_map = _load_sync_map()
+    sync_state = _load_sync_state()
     key = str(event.file_path)
     event_id = sync_map.get(key)
+    fingerprint = _event_fingerprint(event)
+    if event_id and sync_state["fingerprints"].get(key) == fingerprint:
+        return None
+
     service = _service(config)
     body = _event_body(event, config.google_timezone or "Asia/Seoul")
 
@@ -193,7 +293,9 @@ def sync_event(config: AppConfig, event: CalendarEvent) -> str | None:
     google_event_id = str(result.get("id") or "")
     if google_event_id:
         sync_map[key] = google_event_id
+        sync_state["fingerprints"][key] = fingerprint
         _save_sync_map(sync_map)
+        _save_sync_state(sync_state)
     return google_event_id or None
 
 
@@ -210,22 +312,28 @@ def delete_synced_event(config: AppConfig, file_path: Path) -> bool:
         return False
 
     sync_map = _load_sync_map()
+    sync_state = _load_sync_state()
     key = str(file_path)
-    event_id = sync_map.get(key)
+    event_id = sync_map.get(key) or sync_state["tombstones"].get(key) or _google_event_id_from_ics(file_path)
     if not event_id:
+        if sync_state["fingerprints"].pop(key, None) is not None:
+            _save_sync_state(sync_state)
         return False
 
     service = _service(config)
     try:
         service.events().delete(calendarId=config.google_calendar_id or "primary", eventId=event_id).execute()
     except HttpError as exc:
-        if _http_status(exc) != 404:
+        if _http_status(exc) not in {404, 410}:
             raise GoogleCalendarSyncError(f"Google Calendar delete failed: {exc}") from exc
     except Exception as exc:  # noqa: BLE001
         raise GoogleCalendarSyncError(f"Google Calendar delete failed: {exc}") from exc
 
     sync_map.pop(key, None)
+    sync_state["fingerprints"].pop(key, None)
+    sync_state["tombstones"].pop(key, None)
     _save_sync_map(sync_map)
+    _save_sync_state(sync_state)
     return True
 
 
@@ -233,10 +341,103 @@ def move_sync_mapping(old_path: Path, new_path: Path) -> None:
     if old_path == new_path:
         return
     sync_map = _load_sync_map()
+    sync_state = _load_sync_state()
     event_id = sync_map.pop(str(old_path), "")
+    fingerprint = sync_state["fingerprints"].pop(str(old_path), "")
     if event_id:
         sync_map[str(new_path)] = event_id
         _save_sync_map(sync_map)
+    if fingerprint:
+        sync_state["fingerprints"][str(new_path)] = fingerprint
+        _save_sync_state(sync_state)
+
+
+def move_sync_mapping_to_trash(old_path: Path, trashed_path: Path) -> None:
+    """Remember a local deletion until it has been propagated to Google."""
+    if old_path == trashed_path:
+        return
+    sync_map = _load_sync_map()
+    sync_state = _load_sync_state()
+    old_key = str(old_path)
+    trash_key = str(trashed_path)
+    event_id = sync_map.pop(old_key, "") or _google_event_id_from_ics(trashed_path)
+    fingerprint = sync_state["fingerprints"].pop(old_key, "")
+    if event_id:
+        sync_state["tombstones"][trash_key] = event_id
+    if fingerprint:
+        sync_state["fingerprints"][trash_key] = fingerprint
+    _save_sync_map(sync_map)
+    _save_sync_state(sync_state)
+
+
+def restore_sync_mapping(trashed_path: Path, restored_path: Path) -> None:
+    """Cancel a pending Google deletion when a trashed event is restored."""
+    if trashed_path == restored_path:
+        return
+    sync_map = _load_sync_map()
+    sync_state = _load_sync_state()
+    trash_key = str(trashed_path)
+    restored_key = str(restored_path)
+    event_id = sync_state["tombstones"].pop(trash_key, "") or sync_map.pop(trash_key, "")
+    fingerprint = sync_state["fingerprints"].pop(trash_key, "")
+    if event_id:
+        sync_map[restored_key] = event_id
+    if fingerprint:
+        sync_state["fingerprints"][restored_key] = fingerprint
+    _save_sync_map(sync_map)
+    _save_sync_state(sync_state)
+
+
+def _migrate_legacy_trash_mappings(
+    event_dir: Path,
+    sync_map: dict[str, str],
+    sync_state: dict[str, dict[str, str]],
+) -> None:
+    """Convert mappings created by older versions into deletion tombstones."""
+    trash_dir = event_dir / ".coolcalendar-trash"
+    migrated = False
+    for path_text, event_id in list(sync_map.items()):
+        if Path(path_text).parent != trash_dir:
+            continue
+        sync_map.pop(path_text, None)
+        sync_state["tombstones"][path_text] = event_id
+        migrated = True
+    if migrated:
+        _save_sync_map(sync_map)
+        _save_sync_state(sync_state)
+
+
+def flush_pending_deletions(config: AppConfig) -> int:
+    """Delete remotely synced events that were moved to the local trash."""
+    if not google_calendar_ready(config):
+        return 0
+
+    sync_state = _load_sync_state()
+    tombstones = sync_state["tombstones"]
+    if not tombstones:
+        return 0
+
+    service = _service(config)
+    deleted_count = 0
+    for trash_key, event_id in list(tombstones.items()):
+        try:
+            service.events().delete(
+                calendarId=config.google_calendar_id or "primary",
+                eventId=event_id,
+            ).execute()
+        except HttpError as exc:
+            if _http_status(exc) not in {404, 410}:
+                _save_sync_state(sync_state)
+                raise GoogleCalendarSyncError(f"Google Calendar delete failed: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            _save_sync_state(sync_state)
+            raise GoogleCalendarSyncError(f"Google Calendar delete failed: {exc}") from exc
+
+        tombstones.pop(trash_key, None)
+        sync_state["fingerprints"].pop(trash_key, None)
+        deleted_count += 1
+        _save_sync_state(sync_state)
+    return deleted_count
 
 
 def _parse_google_datetime(value: str, timezone: str) -> dt.datetime:
@@ -298,39 +499,70 @@ def import_events(
 
     imported_paths: list[Path] = []
     sync_map = _load_sync_map()
+    sync_state = _load_sync_state()
+    _migrate_legacy_trash_mappings(event_dir, sync_map, sync_state)
+    tombstoned_ids = set(sync_state["tombstones"].values())
+    scope_key = _sync_scope_key(config, start_date, end_date)
+    sync_token = sync_state["tokens"].get(scope_key, "")
     page_token: str | None = None
+    next_sync_token = ""
     event_dir.mkdir(parents=True, exist_ok=True)
 
     while True:
-        try:
-            response = (
-                service.events()
-                .list(
-                    calendarId=config.google_calendar_id or "primary",
-                    timeMin=time_min,
-                    timeMax=time_max,
-                    singleEvents=True,
-                    orderBy="startTime",
-                    pageToken=page_token,
-                )
-                .execute()
+        request_args: dict[str, Any] = {
+            "calendarId": config.google_calendar_id or "primary",
+            "singleEvents": True,
+            "showDeleted": True,
+            "pageToken": page_token,
+        }
+        if sync_token:
+            request_args["syncToken"] = sync_token
+        else:
+            request_args.update(
+                {
+                    "timeMin": time_min,
+                    "timeMax": time_max,
+                    "orderBy": "startTime",
+                }
             )
+
+        try:
+            response = service.events().list(**request_args).execute()
         except HttpError as exc:
+            if sync_token and _http_status(exc) == 410:
+                sync_state["tokens"].pop(scope_key, None)
+                _save_sync_state(sync_state)
+                return import_events(config, event_dir, start_date, end_date, interactive=interactive)
             raise GoogleCalendarSyncError(f"Google Calendar import failed: {exc}") from exc
         except Exception as exc:  # noqa: BLE001
             raise GoogleCalendarSyncError(f"Google Calendar import failed: {exc}") from exc
 
         for item in response.get("items", []):
-            if item.get("status") == "cancelled":
-                continue
-
             google_event_id = str(item.get("id") or "")
             if not google_event_id:
                 continue
 
+            existing_path = _path_for_google_event(sync_map, google_event_id)
+            if item.get("status") == "cancelled":
+                for trash_key, tombstoned_id in list(sync_state["tombstones"].items()):
+                    if tombstoned_id == google_event_id:
+                        sync_state["tombstones"].pop(trash_key, None)
+                        sync_state["fingerprints"].pop(trash_key, None)
+                tombstoned_ids.discard(google_event_id)
+                if existing_path is not None:
+                    try:
+                        existing_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    sync_map.pop(str(existing_path), None)
+                    sync_state["fingerprints"].pop(str(existing_path), None)
+                continue
+
+            if google_event_id in tombstoned_ids:
+                continue
+
             event_date, title, description, all_day, event_end_date, end_time_text = _google_event_fields(item, timezone)
             time_text = "" if all_day else _google_event_time_text(item, timezone)
-            existing_path = _path_for_google_event(sync_map, google_event_id)
             target_path = event_file_path(event_dir, event_date, title, exclude_path=existing_path)
             target_path.write_text(
                 "\r\n".join(
@@ -350,12 +582,28 @@ def import_events(
             if existing_path is not None and existing_path != target_path and existing_path.exists():
                 existing_path.unlink()
                 sync_map.pop(str(existing_path), None)
+                sync_state["fingerprints"].pop(str(existing_path), None)
             sync_map[str(target_path)] = google_event_id
+            imported_event = CalendarEvent(
+                file_path=target_path,
+                date=event_date,
+                title=title,
+                description=description,
+                time_text=time_text,
+                all_day=all_day,
+                end_date=event_end_date,
+                end_time_text=end_time_text,
+            )
+            sync_state["fingerprints"][str(target_path)] = _event_fingerprint(imported_event)
             imported_paths.append(target_path)
 
         page_token = response.get("nextPageToken")
         if not page_token:
+            next_sync_token = str(response.get("nextSyncToken") or "")
             break
 
+    if next_sync_token:
+        sync_state["tokens"][scope_key] = next_sync_token
     _save_sync_map(sync_map)
+    _save_sync_state(sync_state)
     return imported_paths
