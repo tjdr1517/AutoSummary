@@ -1,11 +1,12 @@
 import { app, BrowserWindow } from 'electron'
 import { existsSync, watch, type FSWatcher } from 'node:fs'
 import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
-import type { AppConfig, AppSnapshot, CalendarEvent, EventInput, GoogleSyncResult, MessageAnalysis, TrashedEvent } from '../shared/types'
+import type { AppConfig, AppSnapshot, CalendarEvent, EventInput, GoogleSyncResult, MarkReadResult, MessageAnalysis, TrashedEvent } from '../shared/types'
 import { analyzeMessage, createEventFromAnalysis, loadAnalyses, saveAnalysis } from './services/ai'
 import { loadConfig, saveConfig } from './services/config'
 import { deleteForever, loadEvents, loadTrash, moveEventToTrash, restoreEvent, saveEvent, setEventCompleted } from './services/events'
 import { connectGoogle, moveSyncMapping, moveSyncMappingToTrash, restoreSyncMapping, syncGoogle } from './services/google'
+import { markMessageReadOnServer } from './services/coolmessenger-protocol'
 import { buildEventDescription, readRecentMessages } from './services/messages'
 
 export class AppController {
@@ -109,6 +110,12 @@ export class AppController {
     this.assertPathInside(filePath, this.config.eventDir)
     setEventCompleted(filePath, completed)
     this.refresh()
+  }
+
+  async markMessageRead(messageKey: number): Promise<MarkReadResult> {
+    const result = await markMessageReadOnServer(this.config.dbPath, messageKey)
+    if (result.marked) this.refresh()
+    return result
   }
 
   async analyze(messageKey: number, createEvent: boolean): Promise<MessageAnalysis> {

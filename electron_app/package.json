@@ -17,6 +17,8 @@
   "dependencies": {
     "better-sqlite3": "^12.2.0",
     "googleapis": "^155.0.0",
+    "iconv-lite": "^0.7.3",
+    "kisa-seed": "^1.0.1",
     "openai": "^5.10.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"

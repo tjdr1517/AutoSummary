@@ -150,9 +150,11 @@ function fromLegacy(raw: Record<string, unknown>, sourcePath: string): AppConfig
 
 function normalize(raw: Partial<AppConfig>): AppConfig {
   const defaults = defaultConfig()
+  const requestedDbPath = String(raw.dbPath || '')
   return {
     ...defaults,
     ...raw,
+    dbPath: requestedDbPath && existsSync(requestedDbPath) ? requestedDbPath : defaults.dbPath,
     mainBounds: asBounds(raw.mainBounds),
     overlayBounds: asBounds(raw.overlayBounds),
     uiTheme: raw.uiTheme === 'dark' ? 'dark' : 'light',

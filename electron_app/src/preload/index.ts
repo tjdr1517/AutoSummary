@@ -12,6 +12,7 @@ const api: CoolCalendarApi = {
   restoreEvent: (filePath) => ipcRenderer.invoke('event:restore', filePath),
   deleteForever: (filePath) => ipcRenderer.invoke('event:delete-forever', filePath),
   setCompleted: (filePath, completed) => ipcRenderer.invoke('event:set-completed', filePath, completed),
+  markMessageRead: (messageKey) => ipcRenderer.invoke('message:mark-read', messageKey),
   analyzeMessage: (messageKey, createEvent) => ipcRenderer.invoke('ai:analyze', messageKey, createEvent),
   syncGoogle: () => ipcRenderer.invoke('google:sync'),
   connectGoogle: () => ipcRenderer.invoke('google:connect'),

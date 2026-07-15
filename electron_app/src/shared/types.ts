@@ -3,6 +3,7 @@ export type MessageDirection = 'recv' | 'send'
 export interface Message {
   key: number
   direction: MessageDirection
+  unread: boolean
   peer: string
   title: string
   whenText: string
@@ -104,6 +105,11 @@ export interface GoogleSyncResult {
   deleted: number
 }
 
+export interface MarkReadResult {
+  marked: boolean
+  alreadyRead: boolean
+}
+
 export type AppEventName = 'data-changed' | 'sync-status' | 'overlay-visibility'
 
 export interface CoolCalendarApi {
@@ -117,6 +123,7 @@ export interface CoolCalendarApi {
   restoreEvent: (filePath: string) => Promise<CalendarEvent | null>
   deleteForever: (filePath: string) => Promise<boolean>
   setCompleted: (filePath: string, completed: boolean) => Promise<void>
+  markMessageRead: (messageKey: number) => Promise<MarkReadResult>
   analyzeMessage: (messageKey: number, createEvent: boolean) => Promise<MessageAnalysis>
   syncGoogle: () => Promise<GoogleSyncResult>
   connectGoogle: () => Promise<void>

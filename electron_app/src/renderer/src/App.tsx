@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AppConfig, CalendarEvent, Message, MessageAnalysis } from '../../shared/types'
 import { CalendarBoard, EmptyState, EventEditor, SettingsModal, Toast, TrashModal, WindowControls } from './components'
 import { eventTime, monthStart, occursOn, shiftMonth, shortDate, todayIso } from './date-utils'
@@ -22,6 +22,7 @@ export function MainApp(): React.JSX.Element {
   const [syncing, setSyncing] = useState(false)
   const [syncText, setSyncText] = useState('')
   const [overlayVisible, setOverlayVisible] = useState(false)
+  const markingRead = useRef(new Set<number>())
 
   const notify = (message: string, kind: ToastState['kind'] = 'info'): void => setToast({ message, kind })
 
@@ -74,6 +75,16 @@ export function MainApp(): React.JSX.Element {
     setSelectedDate(date)
     setMonth(monthStart(date))
     setSelectedEventPath(null)
+  }
+
+  const selectMessage = (message: Message): void => {
+    setSelectedMessageKey(message.key)
+    setSelectedEventPath(null)
+    if (message.direction !== 'recv' || !message.unread || markingRead.current.has(message.key)) return
+    markingRead.current.add(message.key)
+    void window.coolcalendar.markMessageRead(message.key)
+      .catch((reason) => notify(reason instanceof Error ? reason.message : String(reason), 'error'))
+      .finally(() => markingRead.current.delete(message.key))
   }
 
   const analyze = async (createEvent: boolean): Promise<void> => {
@@ -144,7 +155,7 @@ export function MainApp(): React.JSX.Element {
         <div className="message-list">
           {messages.length === 0 ? <EmptyState title="표시할 메시지가 없습니다" detail="검색어나 필터를 바꿔 보세요." /> : messages.map((message) => {
             const analysis = snapshot.analyses[message.key]
-            return <button key={message.key} draggable className={`message-row ${message.key === selectedMessageKey && !selectedEvent ? 'selected' : ''}`} onDragStart={(event) => { event.dataTransfer.setData('application/x-coolcalendar-message', String(message.key)); event.dataTransfer.effectAllowed = 'copy' }} onClick={() => { setSelectedMessageKey(message.key); setSelectedEventPath(null) }}>
+            return <button key={message.key} draggable className={`message-row ${message.unread ? 'unread' : ''} ${message.key === selectedMessageKey && !selectedEvent ? 'selected' : ''}`} onDragStart={(event) => { event.dataTransfer.setData('application/x-coolcalendar-message', String(message.key)); event.dataTransfer.effectAllowed = 'copy' }} onClick={() => selectMessage(message)}>
               <span className="avatar">{(message.peer || '?').slice(0, 1)}</span>
               <span className="message-copy"><span className="message-meta"><b>{message.peer || '알 수 없음'}</b><time>{formatMessageTime(message.whenText)}</time></span><strong>{message.title || '(제목 없음)'}</strong><small>{analysis?.summary || message.body || '내용 없음'}</small><span className="message-badges">{analysis?.hasActionItem && <i>할 일</i>}{analysis?.shouldCreateEvent && <i className="accent">일정 추천</i>}{message.filePath && <i>첨부</i>}</span></span>
             </button>

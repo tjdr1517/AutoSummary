@@ -6,6 +6,7 @@ import type { Message } from '../../shared/types'
 
 interface MessageRow {
   MessageKey: number
+  IsUnRead: number
   Peer: string | null
   Title: string | null
   MessageDate: string | null
@@ -20,6 +21,7 @@ function readTable(db: Database.Database, table: 'tbl_recv' | 'tbl_send', limit:
   const dateColumn = incoming ? 'ReceiveDate' : 'SendDate'
   const rows = db.prepare(`
     SELECT MessageKey,
+      ${incoming ? 'COALESCE(IsUnRead, 0)' : '0'} AS IsUnRead,
       COALESCE(${personColumn}, '') AS Peer,
       COALESCE(Title, '') AS Title,
       COALESCE(${dateColumn}, '') AS MessageDate,
@@ -34,6 +36,7 @@ function readTable(db: Database.Database, table: 'tbl_recv' | 'tbl_send', limit:
   return rows.reverse().map((row) => ({
     key: Number(row.MessageKey),
     direction: incoming ? 'recv' : 'send',
+    unread: incoming && Number(row.IsUnRead) !== 0,
     peer: String(row.Peer ?? '').trim(),
     title: String(row.Title ?? '').trim(),
     whenText: String(row.MessageDate ?? '').trim(),
