@@ -20,3 +20,10 @@ venv/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Electron build outputs and dependencies
+electron_app/node_modules/
+electron_app/out/
+electron_app/release/
+electron_app/output/
+electron_app/.playwright-cli/

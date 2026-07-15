@@ -1,0 +1,71 @@
+{
+  "name": "coolcalendar-electron",
+  "version": "1.0.0",
+  "description": "CoolMessenger messages and calendar desktop assistant",
+  "author": "CoolCalendar",
+  "private": true,
+  "main": "out/main/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "icon": "node scripts/build-icon.mjs",
+    "build": "electron-vite build && tsc --noEmit",
+    "preview": "electron-vite preview",
+    "dist": "npm run build && electron-builder --win nsis",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.2.0",
+    "googleapis": "^155.0.0",
+    "openai": "^5.10.2",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.30",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "electron": "^39.8.6",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^3.1.0",
+    "png-to-ico": "^3.0.1",
+    "sharp": "^0.34.3",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  },
+  "build": {
+    "appId": "kr.coolcalendar.desktop",
+    "productName": "CoolCalendar",
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*"
+    ],
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "src/renderer/src/assets/OFL-NotoSansKR.txt",
+        "to": "licenses/OFL-NotoSansKR.txt"
+      }
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "artifactName": "CoolCalendar-${version}-Setup.${ext}",
+    "win": {
+      "target": "nsis",
+      "executableName": "CoolCalendar",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
