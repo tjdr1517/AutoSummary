@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webFrame } from 'electron'
 import type { AppConfig, AppEventName, CoolCalendarApi, EventInput } from '../shared/types'
 
 const api: CoolCalendarApi = {
@@ -12,6 +12,7 @@ const api: CoolCalendarApi = {
   restoreEvent: (filePath) => ipcRenderer.invoke('event:restore', filePath),
   deleteForever: (filePath) => ipcRenderer.invoke('event:delete-forever', filePath),
   setCompleted: (filePath, completed) => ipcRenderer.invoke('event:set-completed', filePath, completed),
+  loginCoolMessenger: () => ipcRenderer.invoke('messenger:login'),
   markMessageRead: (messageKey) => ipcRenderer.invoke('message:mark-read', messageKey),
   analyzeMessage: (messageKey, createEvent) => ipcRenderer.invoke('ai:analyze', messageKey, createEvent),
   syncGoogle: () => ipcRenderer.invoke('google:sync'),
@@ -20,6 +21,7 @@ const api: CoolCalendarApi = {
   showMain: () => ipcRenderer.invoke('window:show-main'),
   openExternal: (target) => ipcRenderer.invoke('shell:open', target),
   showItemInFolder: (target) => ipcRenderer.invoke('shell:show-item', target),
+  setUiZoom: (scale) => webFrame.setZoomFactor(Math.min(1.35, Math.max(0.9, scale))),
   windowAction: (action) => ipcRenderer.invoke('window:action', action),
   on: (event: AppEventName, callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown): void => callback(payload)

@@ -166,6 +166,7 @@ function registerIpc(): void {
   ipcMain.handle('event:restore', (_event, path: string) => controller!.restoreCalendarEvent(path))
   ipcMain.handle('event:delete-forever', (_event, path: string) => controller!.deleteForever(path))
   ipcMain.handle('event:set-completed', (_event, path: string, done: boolean) => controller!.setCompleted(path, done))
+  ipcMain.handle('messenger:login', () => controller!.loginCoolMessenger())
   ipcMain.handle('message:mark-read', (_event, key: number) => controller!.markMessageRead(key))
   ipcMain.handle('ai:analyze', (_event, key: number, createEvent: boolean) => controller!.analyze(key, createEvent))
   ipcMain.handle('google:connect', () => controller!.connectGoogle())

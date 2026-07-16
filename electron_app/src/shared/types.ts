@@ -59,6 +59,8 @@ export interface AppConfig {
   refreshSeconds: number
   recentLimit: number
   uiTheme: 'light' | 'dark'
+  uiFontFamily: 'coolcalendar' | 'malgun' | 'system'
+  uiFontScale: number
   mainBounds?: WindowBounds
   overlayBounds?: WindowBounds
   overlayTheme: 'navy' | 'black' | 'glass'
@@ -79,11 +81,38 @@ export interface AppConfig {
   launchAtLogin: boolean
 }
 
+export type ContactPresence = 'online' | 'away' | 'offline' | 'unknown'
+
+export interface MessengerContact {
+  key: number
+  name: string
+  displayName: string
+  role: string
+  extension: string
+  status: ContactPresence
+}
+
+export interface MessengerGroup {
+  key: number
+  name: string
+  memberKeys: number[]
+}
+
+export interface MessengerDirectory {
+  connected: boolean
+  syncing: boolean
+  groups: MessengerGroup[]
+  contacts: MessengerContact[]
+  error: string
+  updatedAt: string
+}
+
 export interface AppSnapshot {
   config: AppConfig
   messages: Message[]
   events: CalendarEvent[]
   analyses: Record<number, MessageAnalysis>
+  directory: MessengerDirectory
   dbError?: string
 }
 
@@ -123,6 +152,7 @@ export interface CoolCalendarApi {
   restoreEvent: (filePath: string) => Promise<CalendarEvent | null>
   deleteForever: (filePath: string) => Promise<boolean>
   setCompleted: (filePath: string, completed: boolean) => Promise<void>
+  loginCoolMessenger: () => Promise<void>
   markMessageRead: (messageKey: number) => Promise<MarkReadResult>
   analyzeMessage: (messageKey: number, createEvent: boolean) => Promise<MessageAnalysis>
   syncGoogle: () => Promise<GoogleSyncResult>
@@ -131,6 +161,7 @@ export interface CoolCalendarApi {
   showMain: () => Promise<void>
   openExternal: (target: string) => Promise<void>
   showItemInFolder: (target: string) => Promise<void>
+  setUiZoom: (scale: number) => void
   windowAction: (action: 'minimize' | 'maximize' | 'close') => Promise<void>
   on: (event: AppEventName, callback: (payload: unknown) => void) => () => void
 }

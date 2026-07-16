@@ -35,6 +35,8 @@ function defaultConfig(): AppConfig {
     refreshSeconds: 15,
     recentLimit: 250,
     uiTheme: 'light',
+    uiFontFamily: 'coolcalendar',
+    uiFontScale: 110,
     overlayTheme: 'black',
     overlayOpacity: 72,
     overlayFontScale: 100,
@@ -158,6 +160,10 @@ function normalize(raw: Partial<AppConfig>): AppConfig {
     mainBounds: asBounds(raw.mainBounds),
     overlayBounds: asBounds(raw.overlayBounds),
     uiTheme: raw.uiTheme === 'dark' ? 'dark' : 'light',
+    uiFontFamily: ['coolcalendar', 'malgun', 'system'].includes(String(raw.uiFontFamily))
+      ? raw.uiFontFamily as AppConfig['uiFontFamily']
+      : defaults.uiFontFamily,
+    uiFontScale: Math.min(135, Math.max(90, Number(raw.uiFontScale ?? defaults.uiFontScale))),
     refreshSeconds: Math.min(3600, Math.max(3, Number(raw.refreshSeconds ?? defaults.refreshSeconds))),
     recentLimit: Math.min(2000, Math.max(20, Number(raw.recentLimit ?? defaults.recentLimit))),
     overlayOpacity: Math.min(100, Math.max(20, Number(raw.overlayOpacity ?? defaults.overlayOpacity))),

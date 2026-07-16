@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import type { AppConfig, CalendarEvent, EventInput, Message, TrashedEvent } from '../../shared/types'
+import type { AppConfig, CalendarEvent, EventInput, Message, MessengerDirectory, TrashedEvent } from '../../shared/types'
 import { calendarDays, eventTime, guessMessageDate, guessMessageTime, monthStart, monthTitle, occursOn, shortDate, todayIso } from './date-utils'
 
 export function WindowControls({ overlay = false }: { overlay?: boolean }): React.JSX.Element {
@@ -176,6 +176,24 @@ export function SettingsModal({ config, onClose, onSaved, notify }: {
               <span className="theme-preview theme-preview-dark"><i /><i /><i /></span><span><b>어둡게</b><small>저조도 환경</small></span>
             </button>
           </div>
+          <section className="typography-settings">
+            <div>
+              <h3>글자</h3>
+              <p className="setting-help">앱 전체의 글꼴과 글자 크기를 조정합니다. 일정, 메시지, 주소록과 설정 화면에 함께 적용됩니다.</p>
+            </div>
+            <div className="form-row typography-controls">
+              <label><span>글꼴</span><select value={draft.uiFontFamily} onChange={(e) => patch('uiFontFamily', e.target.value as AppConfig['uiFontFamily'])}>
+                <option value="coolcalendar">CoolCalendar Sans</option>
+                <option value="malgun">맑은 고딕</option>
+                <option value="system">Windows 시스템 글꼴</option>
+              </select></label>
+              <RangeField label="글자 크기" value={draft.uiFontScale} min={90} max={135} unit="%" onChange={(value) => patch('uiFontScale', value)} />
+            </div>
+            <div className={`font-preview font-preview-${draft.uiFontFamily}`} style={{ fontSize: `${draft.uiFontScale / 100}rem` }}>
+              <b>일정과 메시지를 편안하게 읽어보세요</b>
+              <span>가나다라마바사 · ABC 123</span>
+            </div>
+          </section>
           <div className="appearance-note"><b>절제된 화면</b><span>중성 색상과 얇은 구분선을 사용해 콘텐츠에 집중하도록 구성했습니다.</span></div>
         </>}
         {tab === 'general' && <>
@@ -224,6 +242,63 @@ function ToggleRow({ label, description, value, onChange }: { label: string; des
 
 function RangeField({ label, value, min, max, unit, onChange }: { label: string; value: number; min: number; max: number; unit: string; onChange: (value: number) => void }): React.JSX.Element {
   return <label><span>{label} · {value}{unit}</span><input className="range" type="range" value={value} min={min} max={max} onChange={(e) => onChange(Number(e.target.value))} /></label>
+}
+
+export function DirectoryModal({ directory, onClose }: { directory: MessengerDirectory; onClose: () => void }): React.JSX.Element {
+  const [query, setQuery] = useState('')
+  const normalized = query.trim().toLocaleLowerCase('ko')
+  const contactMap = useMemo(() => new Map(directory.contacts.map((contact) => [contact.key, contact])), [directory.contacts])
+  const groups = useMemo(() => directory.groups.map((group) => {
+    const groupMatches = Boolean(normalized) && group.name.toLocaleLowerCase('ko').includes(normalized)
+    const contacts = group.memberKeys
+      .map((key) => contactMap.get(key))
+      .filter((contact): contact is NonNullable<typeof contact> => Boolean(contact))
+      .filter((contact) => groupMatches || !normalized || `${contact.name} ${contact.displayName} ${contact.role} ${contact.extension}`.toLocaleLowerCase('ko').includes(normalized))
+    return { ...group, contacts }
+  }).filter((group) => group.contacts.length > 0), [contactMap, directory.groups, normalized])
+  const onlineCount = directory.contacts.filter((contact) => contact.status === 'online').length
+  const awayCount = directory.contacts.filter((contact) => contact.status === 'away').length
+
+  return <Modal title="주소록" subtitle="쿨메신저 조직도와 현재 접속 상태" onClose={onClose} size="large">
+    <div className="directory-shell">
+      <div className="directory-toolbar">
+        <label className="directory-search"><span>⌕</span><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="이름, 부서, 담당 업무, 내선 검색" /></label>
+        <div className="directory-connection">
+          <span className={`presence-dot ${directory.connected ? 'online' : 'unknown'}`} />
+          <b>{directory.connected ? '연결됨' : '연결 중'}</b>
+          <span>{directory.contacts.length}명</span>
+        </div>
+      </div>
+      <div className="directory-summary">
+        <span><i className="presence-dot online" />온라인 {onlineCount}</span>
+        <span><i className="presence-dot away" />자리 비움 {awayCount}</span>
+        <span><i className="presence-dot offline" />오프라인 {Math.max(0, directory.contacts.length - onlineCount - awayCount)}</span>
+        {directory.syncing && <span className="directory-syncing"><i className="spinner" />주소록 갱신 중</span>}
+      </div>
+      {directory.error && <div className="directory-alert">{directory.error} 다시 연결을 시도하고 있습니다.</div>}
+      <div className="directory-tree">
+        {groups.length === 0 && !directory.syncing
+          ? <EmptyState title="검색 결과가 없습니다" detail="다른 이름이나 부서명으로 검색해 보세요." />
+          : groups.map((group, index) => <details className="directory-group" key={`${group.key}-${group.name}`} open={Boolean(normalized) || index < 2}>
+            <summary><span className="directory-chevron">›</span><b>{group.name}</b><small>{group.contacts.length}</small></summary>
+            <div className="directory-members">
+              {group.contacts.map((contact) => <div className="directory-contact" key={contact.key}>
+                <span className={`presence-dot ${contact.status}`} title={presenceLabel(contact.status)} />
+                <span className="directory-avatar">{contact.name.slice(0, 1)}</span>
+                <span className="directory-person"><b>{contact.name}</b>{contact.role && <small>{contact.role}</small>}{contact.extension && <span className="directory-extension">{contact.extension}</span>}</span>
+              </div>)}
+            </div>
+          </details>)}
+      </div>
+    </div>
+  </Modal>
+}
+
+function presenceLabel(status: 'online' | 'away' | 'offline' | 'unknown'): string {
+  if (status === 'online') return '온라인'
+  if (status === 'away') return '자리 비움'
+  if (status === 'offline') return '오프라인'
+  return '상태 확인 중'
 }
 
 export function TrashModal({ onClose, onChanged, notify }: { onClose: () => void; onChanged: () => void; notify: (message: string, kind?: 'success' | 'error') => void }): React.JSX.Element {

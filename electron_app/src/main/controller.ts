@@ -1,12 +1,12 @@
 import { app, BrowserWindow } from 'electron'
 import { existsSync, watch, type FSWatcher } from 'node:fs'
 import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
-import type { AppConfig, AppSnapshot, CalendarEvent, EventInput, GoogleSyncResult, MarkReadResult, MessageAnalysis, TrashedEvent } from '../shared/types'
+import type { AppConfig, AppSnapshot, CalendarEvent, EventInput, GoogleSyncResult, MarkReadResult, MessageAnalysis, MessengerDirectory, TrashedEvent } from '../shared/types'
 import { analyzeMessage, createEventFromAnalysis, loadAnalyses, saveAnalysis } from './services/ai'
 import { loadConfig, saveConfig } from './services/config'
 import { deleteForever, loadEvents, loadTrash, moveEventToTrash, restoreEvent, saveEvent, setEventCompleted } from './services/events'
 import { connectGoogle, moveSyncMapping, moveSyncMappingToTrash, restoreSyncMapping, syncGoogle } from './services/google'
-import { markMessageReadOnServer } from './services/coolmessenger-protocol'
+import { CoolMessengerSession } from './services/coolmessenger-protocol'
 import { buildEventDescription, readRecentMessages } from './services/messages'
 
 export class AppController {
@@ -17,13 +17,22 @@ export class AppController {
   private debounceTimer?: NodeJS.Timeout
   private autoAnalysisRunning = false
   private googleSyncRunning = false
+  private readonly messenger: CoolMessengerSession
 
   constructor(private readonly windows: () => BrowserWindow[]) {
     this.config = loadConfig()
-    this.snapshot = { config: this.config, messages: [], events: [], analyses: {} }
+    const directory: MessengerDirectory = {
+      connected: false, syncing: true, groups: [], contacts: [], error: '', updatedAt: ''
+    }
+    this.snapshot = { config: this.config, messages: [], events: [], analyses: {}, directory }
+    this.messenger = new CoolMessengerSession(this.config.dbPath, (nextDirectory) => {
+      this.snapshot = { ...this.snapshot, directory: nextDirectory }
+      this.broadcast('data-changed', this.snapshot)
+    })
     this.refresh(false)
     this.restartWatchers()
     this.applyLoginSetting()
+    this.messenger.start()
   }
 
   getConfig(): AppConfig { return this.config }
@@ -40,7 +49,7 @@ export class AppController {
     }
     const events = loadEvents(this.config.eventDir)
     const analyses = loadAnalyses(this.config.dbPath)
-    this.snapshot = { config: this.config, messages, events, analyses, dbError }
+    this.snapshot = { config: this.config, messages, events, analyses, directory: this.snapshot.directory, dbError }
     if (notify) this.broadcast('data-changed', this.snapshot)
     if (this.config.aiAutoEnabled) void this.runAutoAnalysis()
     return this.snapshot
@@ -53,6 +62,7 @@ export class AppController {
       patch = { ...patch, aiLastProcessedMessageKey: Math.max(0, ...this.snapshot.messages.map((message) => message.key)) }
     }
     this.config = saveConfig({ ...this.config, ...patch })
+    if (oldDb !== this.config.dbPath) this.messenger.updateDbPath(this.config.dbPath)
     this.applyLoginSetting()
     if (oldDb !== this.config.dbPath || oldEventDir !== this.config.eventDir || patch.refreshSeconds) this.restartWatchers()
     this.refresh()
@@ -113,9 +123,13 @@ export class AppController {
   }
 
   async markMessageRead(messageKey: number): Promise<MarkReadResult> {
-    const result = await markMessageReadOnServer(this.config.dbPath, messageKey)
+    const result = await this.messenger.markMessageRead(messageKey)
     if (result.marked) this.refresh()
     return result
+  }
+
+  async loginCoolMessenger(): Promise<void> {
+    await this.messenger.login()
   }
 
   async analyze(messageKey: number, createEvent: boolean): Promise<MessageAnalysis> {
@@ -167,6 +181,7 @@ export class AppController {
     for (const watcher of this.watchers) watcher.close()
     if (this.refreshTimer) clearInterval(this.refreshTimer)
     if (this.debounceTimer) clearTimeout(this.debounceTimer)
+    this.messenger.dispose()
   }
 
   private broadcast(channel: string, payload: unknown): void {

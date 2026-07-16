@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AppConfig, CalendarEvent, Message, MessageAnalysis } from '../../shared/types'
-import { CalendarBoard, EmptyState, EventEditor, SettingsModal, Toast, TrashModal, WindowControls } from './components'
+import { CalendarBoard, DirectoryModal, EmptyState, EventEditor, SettingsModal, Toast, TrashModal, WindowControls } from './components'
 import { eventTime, monthStart, occursOn, shiftMonth, shortDate, todayIso } from './date-utils'
 import { useAppSnapshot } from './hooks'
 
@@ -13,14 +13,16 @@ export function MainApp(): React.JSX.Element {
   const [selectedMessageKey, setSelectedMessageKey] = useState<number | null>(null)
   const [selectedEventPath, setSelectedEventPath] = useState<string | null>(null)
   const [query, setQuery] = useState('')
+  const [readFilter, setReadFilter] = useState<'unread' | 'read'>('unread')
   const [messageFilter, setMessageFilter] = useState<'all' | 'schedule' | 'analyzed' | 'attachment'>('all')
   const [editor, setEditor] = useState<{ event?: CalendarEvent; message?: Message; date?: string } | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
+  const [directoryOpen, setDirectoryOpen] = useState(false)
   const [toast, setToast] = useState<ToastState | null>(null)
   const [analyzing, setAnalyzing] = useState(false)
   const [syncing, setSyncing] = useState(false)
-  const [syncText, setSyncText] = useState('')
+  const [messengerLoggingIn, setMessengerLoggingIn] = useState(false)
   const [overlayVisible, setOverlayVisible] = useState(false)
   const markingRead = useRef(new Set<number>())
 
@@ -33,7 +35,6 @@ export function MainApp(): React.JSX.Element {
   useEffect(() => window.coolcalendar.on('sync-status', (payload) => {
     const status = payload as { running?: boolean; message?: string; error?: string }
     setSyncing(Boolean(status.running))
-    if (status.message) setSyncText(status.message)
     if (status.error) notify(status.error, 'error')
   }), [])
 
@@ -41,7 +42,9 @@ export function MainApp(): React.JSX.Element {
 
   useEffect(() => {
     document.documentElement.dataset.theme = snapshot?.config.uiTheme ?? 'light'
-  }, [snapshot?.config.uiTheme])
+    document.documentElement.dataset.font = snapshot?.config.uiFontFamily ?? 'coolcalendar'
+    window.coolcalendar.setUiZoom((snapshot?.config.uiFontScale ?? 110) / 100)
+  }, [snapshot?.config.uiTheme, snapshot?.config.uiFontFamily, snapshot?.config.uiFontScale])
 
   useEffect(() => {
     const listener = (event: KeyboardEvent): void => {
@@ -57,19 +60,21 @@ export function MainApp(): React.JSX.Element {
     const normalized = query.trim().toLocaleLowerCase('ko')
     return [...snapshot.messages].reverse().filter((message) => {
       const analysis = snapshot.analyses[message.key]
+      if (readFilter === 'unread' && (message.direction !== 'recv' || !message.unread)) return false
+      if (readFilter === 'read' && (message.direction !== 'recv' || message.unread)) return false
       if (messageFilter === 'schedule' && !analysis?.shouldCreateEvent) return false
       if (messageFilter === 'analyzed' && !analysis) return false
       if (messageFilter === 'attachment' && !message.filePath) return false
       return !normalized || `${message.peer} ${message.title} ${message.body}`.toLocaleLowerCase('ko').includes(normalized)
     })
-  }, [snapshot, query, messageFilter])
+  }, [snapshot, query, readFilter, messageFilter])
 
   const selectedMessage = snapshot?.messages.find((message) => message.key === selectedMessageKey)
   const selectedEvent = snapshot?.events.find((event) => event.filePath === selectedEventPath)
   const selectedAnalysis = selectedMessage ? snapshot?.analyses[selectedMessage.key] : undefined
   const dayEvents = snapshot?.events.filter((event) => occursOn(event, selectedDate)) ?? []
-  const upcomingCount = snapshot?.events.filter((event) => !event.completed && event.date >= todayIso() && event.date <= addDays(todayIso(), 14)).length ?? 0
-  const actionCount = Object.values(snapshot?.analyses ?? {}).filter((analysis) => analysis.hasActionItem).length
+  const unreadCount = snapshot?.messages.filter((message) => message.direction === 'recv' && message.unread).length ?? 0
+  const readCount = snapshot?.messages.filter((message) => message.direction === 'recv' && !message.unread).length ?? 0
 
   const selectDate = (date: string): void => {
     setSelectedDate(date)
@@ -119,19 +124,33 @@ export function MainApp(): React.JSX.Element {
     catch (reason) { notify(String(reason), 'error') }
   }
 
+  const loginCoolMessenger = async (): Promise<void> => {
+    setMessengerLoggingIn(true)
+    try {
+      await window.coolcalendar.loginCoolMessenger()
+      notify('쿨메신저에 로그인했습니다.', 'success')
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason), 'error')
+    } finally {
+      setMessengerLoggingIn(false)
+    }
+  }
+
   if (!snapshot) return <div className="startup-screen"><div className="startup-mark">C</div><p>{error || 'CoolCalendar를 준비하고 있습니다…'}</p></div>
 
   return <div className="app-shell">
     <header className="titlebar drag-region">
       <div className="brand"><span className="brand-mark">C</span><div><b>CoolCalendar</b><small>메시지와 일정</small></div></div>
       <div className="title-status no-drag">
-        <span className={`status-dot ${snapshot.dbError ? 'warning' : ''}`} />
-        <span>{snapshot.dbError ? '메시지 DB 연결 확인 필요' : `메시지 ${snapshot.messages.length}개`}</span>
-        {syncText && <span className="status-divider">·</span>}
-        {syncText && <span>{syncText}</span>}
+        <span className={`status-dot ${snapshot.directory.connected ? '' : 'warning'}`} />
+        <span>{snapshot.directory.connected ? '쿨메신저 로그인됨' : '쿨메신저 로그아웃됨'}</span>
+        {!snapshot.directory.connected && <button className="messenger-login-button" disabled={messengerLoggingIn} onClick={() => void loginCoolMessenger()}>
+          {messengerLoggingIn ? <><span className="spinner" />로그인 중</> : '로그인하기'}
+        </button>}
       </div>
       <div className="title-actions no-drag">
         <button className={`top-action ${overlayVisible ? 'active' : ''}`} onClick={() => void window.coolcalendar.showOverlay(!overlayVisible)}>바탕화면</button>
+        <button className={`top-action ${directoryOpen ? 'active' : ''}`} onClick={() => setDirectoryOpen(true)}>주소록</button>
         <button className="top-action" onClick={() => setTrashOpen(true)}>휴지통</button>
         <button className="top-action" onClick={() => setSettingsOpen(true)}>설정</button>
         <WindowControls />
@@ -145,6 +164,10 @@ export function MainApp(): React.JSX.Element {
           <button className={`icon-button refresh-button ${loading ? 'spinning' : ''}`} onClick={() => void refresh()} title="새로고침">↻</button>
         </header>
         <div className="search-box"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="보낸 사람, 제목, 내용 검색" /><kbd>⌘ F</kbd></div>
+        <div className="read-filter" aria-label="읽음 상태 필터">
+          <button className={readFilter === 'unread' ? 'active' : ''} onClick={() => setReadFilter('unread')}>안 읽음 <span>{unreadCount}</span></button>
+          <button className={readFilter === 'read' ? 'active' : ''} onClick={() => setReadFilter('read')}>읽음 <span>{readCount}</span></button>
+        </div>
         <div className="segmented">
           <button className={messageFilter === 'all' ? 'active' : ''} onClick={() => setMessageFilter('all')}>전체</button>
           <button className={messageFilter === 'schedule' ? 'active' : ''} onClick={() => setMessageFilter('schedule')}>일정 제안</button>
@@ -164,12 +187,6 @@ export function MainApp(): React.JSX.Element {
       </aside>
 
       <section className="calendar-column">
-        <div className="stats-row">
-          <Stat label="오늘 일정" value={snapshot.events.filter((event) => occursOn(event, todayIso())).length} detail="오늘 예정된 항목" tone="cyan" />
-          <Stat label="다가오는 일정" value={upcomingCount} detail="앞으로 14일" tone="violet" />
-          <Stat label="확인할 항목" value={actionCount} detail="분석된 메시지" tone="amber" />
-          <button className="new-event-card" onClick={() => setEditor({})}><span>＋</span><div><b>새 일정</b><small>Ctrl N</small></div></button>
-        </div>
         <CalendarBoard
           month={month} selectedDate={selectedDate} events={snapshot.events}
           onSelectDate={selectDate}
@@ -197,16 +214,18 @@ export function MainApp(): React.JSX.Element {
     </main>
 
     {editor && <EventEditor event={editor.event} message={editor.message} date={editor.date || selectedDate} onClose={() => setEditor(null)} onSaved={(event) => { setSelectedDate(event.date); setMonth(monthStart(event.date)); setSelectedEventPath(event.filePath); notify('일정을 저장했습니다.', 'success') }} />}
-    {settingsOpen && <SettingsModal config={snapshot.config} onClose={() => setSettingsOpen(false)} onSaved={(config: AppConfig) => { document.documentElement.dataset.theme = config.uiTheme; void refresh() }} notify={notify} />}
+    {directoryOpen && <DirectoryModal directory={snapshot.directory} onClose={() => setDirectoryOpen(false)} />}
+    {settingsOpen && <SettingsModal config={snapshot.config} onClose={() => setSettingsOpen(false)} onSaved={(config: AppConfig) => {
+      document.documentElement.dataset.theme = config.uiTheme
+      document.documentElement.dataset.font = config.uiFontFamily
+      window.coolcalendar.setUiZoom(config.uiFontScale / 100)
+      void refresh()
+    }} notify={notify} />}
     {trashOpen && <TrashModal onClose={() => setTrashOpen(false)} onChanged={() => void refresh()} notify={notify} />}
     {toast && <Toast {...toast} onClose={() => setToast(null)} />}
     {syncing && <div className="sync-pill"><span className="spinner" /> Google Calendar 동기화 중</div>}
     <button className="sync-fab" disabled={syncing} onClick={() => void sync()} title="Google Calendar 동기화">↥</button>
   </div>
-}
-
-function Stat({ label, value, detail, tone }: { label: string; value: number; detail: string; tone: string }): React.JSX.Element {
-  return <article className={`stat-card tone-${tone}`}><span>{label}</span><div><b>{value}</b><i /></div><small>{detail}</small></article>
 }
 
 function MessageDetail({ message, analysis, analyzing, onAnalyze, onCreateSuggested, onSchedule }: {
@@ -238,10 +257,4 @@ function EventDetail({ event, onEdit, onTrash, onComplete }: { event: CalendarEv
 function formatMessageTime(value: string): string {
   const match = value.match(/(\d{2}:\d{2})/)
   return match?.[1] || value.slice(-8) || ''
-}
-
-function addDays(value: string, amount: number): string {
-  const date = new Date(`${value}T12:00:00`)
-  date.setDate(date.getDate() + amount)
-  return date.toLocaleDateString('sv-SE')
 }
