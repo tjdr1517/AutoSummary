@@ -1,5 +1,6 @@
 import { app, safeStorage } from 'electron'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import type { AppConfig, WindowBounds } from '../../shared/types'
@@ -34,6 +35,12 @@ function defaultConfig(): AppConfig {
     eventDir: join(homedir(), 'Desktop', 'CoolMessenger Calendar Drop'),
     refreshSeconds: 15,
     recentLimit: 250,
+    autoSaveAttachments: false,
+    attachmentSaveDir: join(homedir(), 'Documents', 'CoolMessenger Files', 'Received Files'),
+    attachmentAutoSaveLastMessageKey: 0,
+    messageStateDbId: '',
+    recallProtocolVersion: 3,
+    recalledMemoIds: [],
     uiTheme: 'light',
     uiFontFamily: 'coolcalendar',
     uiFontScale: 110,
@@ -43,7 +50,7 @@ function defaultConfig(): AppConfig {
     openaiApiKey: '',
     openaiModel: 'gpt-5.4-mini',
     aiAutoEnabled: false,
-    aiAutoCreateEvents: false,
+    aiEventSuggestionPopup: false,
     aiLastProcessedMessageKey: 0,
     googleCalendarEnabled: false,
     googleCalendarId: 'primary',
@@ -66,6 +73,11 @@ function asBounds(value: unknown): WindowBounds | undefined {
     width: Math.max(480, Number(item.width)),
     height: Math.max(320, Number(item.height))
   }
+}
+
+function clampNumber(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? Math.min(maximum, Math.max(minimum, numeric)) : fallback
 }
 
 function parseLegacyOverlayBounds(value: unknown): WindowBounds | undefined {
@@ -135,7 +147,7 @@ function fromLegacy(raw: Record<string, unknown>, sourcePath: string): AppConfig
     openaiApiKey: String(raw.openai_api_key || ''),
     openaiModel: String(raw.openai_model || defaults.openaiModel),
     aiAutoEnabled: Boolean(raw.ai_auto_enabled),
-    aiAutoCreateEvents: Boolean(raw.ai_auto_create_events),
+    aiEventSuggestionPopup: Boolean(raw.ai_event_suggestion_popup ?? raw.ai_auto_create_events),
     aiLastProcessedMessageKey: Number(raw.ai_last_processed_message_key || 0),
     googleCalendarEnabled: Boolean(raw.google_calendar_enabled),
     googleCalendarId: String(raw.google_calendar_id || 'primary'),
@@ -152,22 +164,33 @@ function fromLegacy(raw: Record<string, unknown>, sourcePath: string): AppConfig
 
 function normalize(raw: Partial<AppConfig>): AppConfig {
   const defaults = defaultConfig()
-  const requestedDbPath = String(raw.dbPath || '')
+  const legacy = raw as Partial<AppConfig> & { aiAutoCreateEvents?: boolean }
+  const { aiAutoCreateEvents: legacyAutoCreate, ...clean } = legacy
+  const requestedDbPath = String(clean.dbPath || '')
   return {
     ...defaults,
-    ...raw,
+    ...clean,
     dbPath: requestedDbPath && existsSync(requestedDbPath) ? requestedDbPath : defaults.dbPath,
-    mainBounds: asBounds(raw.mainBounds),
-    overlayBounds: asBounds(raw.overlayBounds),
-    uiTheme: raw.uiTheme === 'dark' ? 'dark' : 'light',
-    uiFontFamily: ['coolcalendar', 'malgun', 'system'].includes(String(raw.uiFontFamily))
-      ? raw.uiFontFamily as AppConfig['uiFontFamily']
+    mainBounds: asBounds(clean.mainBounds),
+    overlayBounds: asBounds(clean.overlayBounds),
+    uiTheme: clean.uiTheme === 'dark' ? 'dark' : 'light',
+    uiFontFamily: ['coolcalendar', 'malgun', 'system'].includes(String(clean.uiFontFamily))
+      ? clean.uiFontFamily as AppConfig['uiFontFamily']
       : defaults.uiFontFamily,
-    uiFontScale: Math.min(135, Math.max(90, Number(raw.uiFontScale ?? defaults.uiFontScale))),
-    refreshSeconds: Math.min(3600, Math.max(3, Number(raw.refreshSeconds ?? defaults.refreshSeconds))),
-    recentLimit: Math.min(2000, Math.max(20, Number(raw.recentLimit ?? defaults.recentLimit))),
-    overlayOpacity: Math.min(100, Math.max(20, Number(raw.overlayOpacity ?? defaults.overlayOpacity))),
-    overlayFontScale: Math.min(150, Math.max(75, Number(raw.overlayFontScale ?? defaults.overlayFontScale)))
+    uiFontScale: clampNumber(clean.uiFontScale, defaults.uiFontScale, 90, 135),
+    refreshSeconds: clampNumber(clean.refreshSeconds, defaults.refreshSeconds, 3, 3600),
+    recentLimit: Math.round(clampNumber(clean.recentLimit, defaults.recentLimit, 20, 2000)),
+    attachmentSaveDir: String(clean.attachmentSaveDir || defaults.attachmentSaveDir),
+    attachmentAutoSaveLastMessageKey: Math.max(0, Number(clean.attachmentAutoSaveLastMessageKey || 0) || 0),
+    messageStateDbId: String(clean.messageStateDbId || ''),
+    recallProtocolVersion: 3,
+    recalledMemoIds: [...new Set((clean.recallProtocolVersion === 3 && Array.isArray(clean.recalledMemoIds) ? clean.recalledMemoIds : [])
+      .map(Number).filter((value) => Number.isInteger(value) && value > 0))].slice(-500),
+    aiEventSuggestionPopup: typeof clean.aiEventSuggestionPopup === 'boolean'
+      ? clean.aiEventSuggestionPopup
+      : Boolean(legacyAutoCreate),
+    overlayOpacity: clampNumber(clean.overlayOpacity, defaults.overlayOpacity, 20, 100),
+    overlayFontScale: clampNumber(clean.overlayFontScale, defaults.overlayFontScale, 75, 150)
   }
 }
 
@@ -229,6 +252,13 @@ export function loadConfig(): AppConfig {
 export function saveConfig(config: AppConfig): AppConfig {
   const normalized = normalize(config)
   mkdirSync(dirname(configPath()), { recursive: true })
-  writeFileSync(configPath(), JSON.stringify(serializeConfig(normalized), null, 2), 'utf8')
+  const destination = configPath()
+  const temp = `${destination}.${randomUUID()}.tmp`
+  try {
+    writeFileSync(temp, JSON.stringify(serializeConfig(normalized), null, 2), 'utf8')
+    renameSync(temp, destination)
+  } finally {
+    if (existsSync(temp)) rmSync(temp)
+  }
   return normalized
 }

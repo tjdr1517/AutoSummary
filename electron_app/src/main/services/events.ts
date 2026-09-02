@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, extname, join, parse, resolve } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, parse, relative, resolve } from 'node:path'
 import type { CalendarEvent, EventInput, TrashedEvent } from '../../shared/types'
 import { dataPath } from './config'
 
@@ -18,9 +18,13 @@ function readJson<T>(path: string, fallback: T): T {
 
 function writeJsonAtomic(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true })
-  const temp = `${path}.tmp`
-  writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8')
-  renameSync(temp, path)
+  const temp = `${path}.${randomUUID()}.tmp`
+  try {
+    writeFileSync(temp, JSON.stringify(value, null, 2), 'utf8')
+    renameSync(temp, path)
+  } finally {
+    if (existsSync(temp)) rmSync(temp)
+  }
 }
 
 export function eventKey(path: string): string {
@@ -54,7 +58,7 @@ function clearCompletion(path: string): void {
 }
 
 function escapeIcs(value: string): string {
-  return value.replaceAll('\\', '\\\\').replaceAll(';', '\\;').replaceAll(',', '\\,').replaceAll('\n', '\\n')
+  return value.replaceAll('\\', '\\\\').replaceAll(';', '\\;').replaceAll(',', '\\,').replace(/\r?\n|\r/g, '\\n')
 }
 
 function unescapeIcs(value: string): string {
@@ -64,6 +68,52 @@ function unescapeIcs(value: string): string {
 function safeFilename(value: string): string {
   const clean = value.replace(/[<>:"/\\|?*]/g, '_').trim().replace(/\s+/g, ' ')
   return clean.slice(0, 80) || 'event'
+}
+
+function isValidDate(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+  if (!match) return false
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12)
+  return date.getFullYear() === Number(match[1]) && date.getMonth() === Number(match[2]) - 1 && date.getDate() === Number(match[3])
+}
+
+function isValidTime(value: string): boolean {
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(value)
+}
+
+function validatedEventInput(input: EventInput): EventInput {
+  const title = String(input.title || '').trim().slice(0, 300)
+  const description = String(input.description || '').slice(0, 200_000)
+  const date = String(input.date || '').trim()
+  const endDate = String(input.endDate || '').trim()
+  const timeText = String(input.timeText || '').trim()
+  const endTimeText = String(input.endTimeText || '').trim()
+  const messageKey = Number(input.messageKey)
+  const messageDbId = String(input.messageDbId || '').trim().toLowerCase()
+  if (!title) throw new Error('일정 제목을 입력해 주세요.')
+  if (!isValidDate(date)) throw new Error('올바른 일정 날짜를 입력해 주세요.')
+  if (endDate && !isValidDate(endDate)) throw new Error('올바른 종료 날짜를 입력해 주세요.')
+  if (endDate && endDate < date) throw new Error('종료 날짜는 시작 날짜보다 빠를 수 없습니다.')
+  if (!input.allDay && !isValidTime(timeText)) throw new Error('올바른 시작 시간을 입력해 주세요.')
+  if (!input.allDay && endTimeText && !isValidTime(endTimeText)) throw new Error('올바른 종료 시간을 입력해 주세요.')
+  return {
+    ...input,
+    title,
+    description,
+    date,
+    endDate: endDate || undefined,
+    timeText: input.allDay ? '' : timeText,
+    endTimeText: input.allDay ? undefined : endTimeText || undefined,
+    messageKey: Number.isInteger(messageKey) && messageKey > 0 ? messageKey : undefined,
+    messageDbId: /^[0-9a-f]{16}$/.test(messageDbId) ? messageDbId : undefined
+  }
+}
+
+function assertEventPath(path: string, eventDir: string): void {
+  const result = relative(resolve(eventDir), resolve(path))
+  if (!result || result.startsWith('..') || isAbsolute(result) || dirname(resolve(path)).toLocaleLowerCase('en-US') !== resolve(eventDir).toLocaleLowerCase('en-US') || extname(path).toLowerCase() !== '.ics') {
+    throw new Error('허용되지 않은 일정 파일 경로입니다.')
+  }
 }
 
 function availableEventPath(eventDir: string, date: string, title: string, excludePath = ''): string {
@@ -87,6 +137,8 @@ export function buildEventText(input: EventInput, uid = `${randomUUID()}@coolcal
     'CALSCALE:GREGORIAN', 'BEGIN:VEVENT', `UID:${uid}`, `DTSTAMP:${stamp}`,
     `SUMMARY:${escapeIcs(title)}`, `DESCRIPTION:${escapeIcs(input.description || '')}`
   ]
+  if (input.messageKey) lines.push(`X-COOLCALENDAR-SOURCE-MESSAGE-KEY:${input.messageKey}`)
+  if (input.messageDbId) lines.push(`X-COOLCALENDAR-SOURCE-DB-ID:${input.messageDbId}`)
   if (input.allDay || !input.timeText) {
     const defaultEnd = addDays(input.date, 1)
     const end = input.endDate && input.endDate > input.date ? input.endDate : defaultEnd
@@ -130,6 +182,31 @@ function unfoldIcs(text: string): string[] {
   return result
 }
 
+export function eventUidFromText(text: string): string {
+  const components: string[] = []
+  const values: string[] = []
+  let eventCount = 0
+  for (const line of unfoldIcs(text.replace(/^\uFEFF/, ''))) {
+    const separator = line.indexOf(':')
+    if (separator < 0) continue
+    const property = line.slice(0, separator)
+    const name = property.split(';', 1)[0].trim().toUpperCase()
+    const value = line.slice(separator + 1)
+    if (name === 'BEGIN') {
+      const component = value.trim().toUpperCase()
+      components.push(component)
+      if (component === 'VEVENT') eventCount += 1
+      continue
+    }
+    if (name === 'END') {
+      components.pop()
+      continue
+    }
+    if (name === 'UID' && components.at(-1) === 'VEVENT') values.push(value.trim())
+  }
+  return eventCount === 1 && values.length === 1 ? values[0] : ''
+}
+
 function parseDateTime(value: string): { date: string; time: string } | null {
   const clean = value.replace(/Z$/, '')
   const match = clean.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})/)
@@ -147,6 +224,8 @@ export function parseIcsFile(path: string): CalendarEvent | null {
   let timeText = ''
   let endTimeText = ''
   let allDay = false
+  let sourceMessageKey: number | undefined
+  let sourceMessageDbId: string | undefined
   for (const raw of unfoldIcs(text)) {
     const separator = raw.indexOf(':')
     if (separator < 0) continue
@@ -169,9 +248,17 @@ export function parseIcsFile(path: string): CalendarEvent | null {
     } else if (key === 'X-MICROSOFT-CDO-ALLDAYEVENT' && value.toUpperCase() === 'TRUE') {
       allDay = true
       timeText = '종일'
+    } else if (key === 'X-COOLCALENDAR-SOURCE-MESSAGE-KEY') {
+      const parsed = Number(value.trim())
+      if (Number.isInteger(parsed) && parsed > 0) sourceMessageKey = parsed
+    } else if (key === 'X-COOLCALENDAR-SOURCE-DB-ID') {
+      const parsed = value.trim().toLowerCase()
+      if (/^[0-9a-f]{16}$/.test(parsed)) sourceMessageDbId = parsed
     }
   }
-  if (!date) return null
+  if (!isValidDate(date) || (!allDay && !isValidTime(timeText))) return null
+  if (endDate && !isValidDate(endDate)) endDate = ''
+  if (endTimeText && !isValidTime(endTimeText)) endTimeText = ''
   return {
     filePath: path,
     date,
@@ -181,7 +268,9 @@ export function parseIcsFile(path: string): CalendarEvent | null {
     allDay,
     endDate,
     endTimeText,
-    completed: completedKeys().has(eventKey(path))
+    completed: completedKeys().has(eventKey(path)),
+    sourceMessageKey,
+    sourceMessageDbId
   }
 }
 
@@ -197,9 +286,19 @@ export function loadEvents(eventDir: string): CalendarEvent[] {
 
 export function saveEvent(eventDir: string, input: EventInput): CalendarEvent {
   mkdirSync(eventDir, { recursive: true })
-  const current = input.filePath || ''
-  const destination = availableEventPath(eventDir, input.date, input.title.trim() || '새 일정', current)
-  writeFileSync(destination, buildEventText(input), 'utf8')
+  const normalized = validatedEventInput(input)
+  const current = normalized.filePath || ''
+  if (current) assertEventPath(current, eventDir)
+  const destination = availableEventPath(eventDir, normalized.date, normalized.title, current)
+  assertEventPath(destination, eventDir)
+  const uid = current && existsSync(current) ? eventUid(current) : ''
+  const temp = join(eventDir, `.${randomUUID()}.ics.tmp`)
+  try {
+    writeFileSync(temp, buildEventText(normalized, uid || undefined), 'utf8')
+    renameSync(temp, destination)
+  } finally {
+    if (existsSync(temp)) rmSync(temp)
+  }
   if (current && current !== destination && existsSync(current)) {
     rmSync(current)
     moveCompletion(current, destination)
@@ -214,11 +313,20 @@ function trashIndex(eventDir: string): string { return join(trashDir(eventDir), 
 
 function loadTrashRecords(eventDir: string): TrashRecord[] {
   const raw = readJson<Array<Record<string, string>>>(trashIndex(eventDir), [])
-  return raw.map((item) => ({
-    trashedName: item.trashedName || item.trashed_name || '',
-    originalPath: item.originalPath || item.original_path || '',
-    deletedAt: item.deletedAt || item.deleted_at || ''
-  })).filter((item) => item.trashedName && item.originalPath)
+  return raw.map((item) => {
+    const trashedName = basename(String(item.trashedName || item.trashed_name || ''))
+    const requestedOriginal = String(item.originalPath || item.original_path || '')
+    let originalPath = requestedOriginal
+    try { assertEventPath(originalPath, eventDir) } catch {
+      const fallbackName = basename(requestedOriginal) || trashedName.replace(/^[0-9a-f]{32}-/i, '') || 'restored-event.ics'
+      originalPath = join(eventDir, extname(fallbackName).toLowerCase() === '.ics' ? fallbackName : `${fallbackName}.ics`)
+    }
+    return {
+      trashedName: extname(trashedName).toLowerCase() === '.ics' ? trashedName : '',
+      originalPath,
+      deletedAt: String(item.deletedAt || item.deleted_at || '')
+    }
+  }).filter((item) => item.trashedName && item.originalPath)
 }
 
 function saveTrashRecords(eventDir: string, records: TrashRecord[]): void {
@@ -230,6 +338,7 @@ function saveTrashRecords(eventDir: string, records: TrashRecord[]): void {
 }
 
 export function moveEventToTrash(eventDir: string, filePath: string): string | null {
+  assertEventPath(filePath, eventDir)
   if (!existsSync(filePath)) return null
   mkdirSync(trashDir(eventDir), { recursive: true })
   const destination = join(trashDir(eventDir), `${randomUUID().replaceAll('-', '')}-${basename(filePath)}`)
@@ -261,11 +370,10 @@ function availableRestorePath(original: string): string {
 
 export function restoreEvent(eventDir: string, trashedPath: string): CalendarEvent | null {
   const records = loadTrashRecords(eventDir)
-  const record = records.find((item) => join(trashDir(eventDir), item.trashedName) === trashedPath)
+  const record = records.find((item) => eventKey(join(trashDir(eventDir), item.trashedName)) === eventKey(trashedPath))
   if (!record || !existsSync(trashedPath)) return null
-  let original = record.originalPath
-  if (!resolve(original).toLowerCase().startsWith(resolve(eventDir).toLowerCase())) original = join(eventDir, basename(original))
-  const destination = availableRestorePath(original)
+  const destination = availableRestorePath(record.originalPath)
+  assertEventPath(destination, eventDir)
   mkdirSync(dirname(destination), { recursive: true })
   renameSync(trashedPath, destination)
   moveCompletion(trashedPath, destination)
@@ -275,7 +383,7 @@ export function restoreEvent(eventDir: string, trashedPath: string): CalendarEve
 
 export function deleteForever(eventDir: string, trashedPath: string): boolean {
   const records = loadTrashRecords(eventDir)
-  const record = records.find((item) => join(trashDir(eventDir), item.trashedName) === trashedPath)
+  const record = records.find((item) => eventKey(join(trashDir(eventDir), item.trashedName)) === eventKey(trashedPath))
   if (!record) return false
   if (existsSync(trashedPath) && statSync(trashedPath).isFile()) rmSync(trashedPath)
   clearCompletion(trashedPath)
@@ -286,8 +394,7 @@ export function deleteForever(eventDir: string, trashedPath: string): boolean {
 export function eventUid(path: string): string {
   const event = parseIcsFile(path)
   if (!event) return ''
-  const text = readFileSync(path, 'utf8')
-  return unfoldIcs(text).find((line) => line.startsWith('UID:'))?.slice(4).trim() || ''
+  return eventUidFromText(readFileSync(path, 'utf8'))
 }
 
 export function fileExtension(path: string): string { return extname(path).toLowerCase() }

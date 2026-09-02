@@ -1,11 +1,9 @@
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
-import OpenAI from 'openai'
-import type { CalendarEvent, EventInput, Message, MessageAnalysis } from '../../shared/types'
+import type { Message, MessageAnalysis } from '../../shared/types'
 import { dataPath } from './config'
-import { buildEventDescription, messageBaseDate, normalizeText } from './messages'
-import { saveEvent } from './events'
+import { messageBaseDate, normalizeText } from './messages'
 
 const ANALYSIS_SCHEMA = {
   type: 'json_schema' as const,
@@ -113,6 +111,7 @@ export async function analyzeMessage(message: Message, apiKey: string, model: st
   const key = (apiKey || process.env.OPENAI_API_KEY || '').trim()
   if (!key) throw new Error('OpenAI API 키가 설정되지 않았습니다.')
   const useModel = model.trim() || 'gpt-5.4-mini'
+  const { default: OpenAI } = await import('openai')
   const client = new OpenAI({ apiKey: key })
   const baseDate = messageBaseDate(message)
   const prompt = [
@@ -125,7 +124,7 @@ export async function analyzeMessage(message: Message, apiKey: string, model: st
     `보낸 사람/상대: ${message.peer || '(이름 없음)'}`,
     `원본 시각: ${message.whenText}`,
     `제목: ${message.title}`,
-    `첨부: ${message.filePath}`,
+    `첨부: ${message.attachments.map((attachment) => attachment.name).join(', ')}`,
     `링크: ${message.linkUrl}`,
     '본문:',
     normalizeText(message.body)
@@ -162,23 +161,4 @@ export async function analyzeMessage(message: Message, apiKey: string, model: st
     model: useModel,
     error: ''
   }
-}
-
-export function createEventFromAnalysis(eventDir: string, message: Message, analysis: MessageAnalysis): CalendarEvent | null {
-  if (!analysis.shouldCreateEvent || !analysis.dueDate) return null
-  const input: EventInput = {
-    date: analysis.dueDate,
-    title: analysis.eventTitle || message.title || message.body.slice(0, 60) || '메시지 일정',
-    description: [
-      '[AI 자동 정리]',
-      `요약: ${analysis.summary || '요약 없음'}`,
-      `판단 근거: ${analysis.reason || '메시지에서 일정 또는 마감 맥락을 감지했습니다.'}`,
-      '',
-      '[원본 메시지]',
-      buildEventDescription(message)
-    ].join('\n'),
-    allDay: analysis.allDay,
-    timeText: analysis.allDay ? '' : analysis.dueTime
-  }
-  return saveEvent(eventDir, input)
 }

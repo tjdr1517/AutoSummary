@@ -31,8 +31,10 @@ npm run dist
 
 ## 주요 기능
 
-- CoolMessenger UDB의 최근 수신 메시지 자동 감시 및 검색
-- 메시지 AI 요약, 할 일 감지, 일정 추천과 자동 생성
+- CoolMessenger UDB의 받은·보낸 쪽지 자동 감시, 읽음 처리, 통합 검색
+- 쿨메신저 주소록 검색, 1:1 쪽지 보내기, 미수신 쪽지 회수
+- 새 첨부파일 자동 저장과 로컬 파일 바로 열기
+- 메시지 AI 요약, 할 일 감지, 일정 후보 팝업과 저장 전 검토
 - 월간 캘린더, 날짜별 일정, 완료 체크리스트
 - 밝은 테마 기본값과 밝게/어둡게 화면 전환
 - 메시지를 날짜로 드래그해서 ICS 일정 생성
@@ -40,6 +42,9 @@ npm run dist
 - Google Calendar OAuth 연결과 로컬/원격 일정 동기화
 - Windows 바탕화면 캘린더 오버레이
 - 트레이 상주, 로그인 시 자동 실행, 창 위치 복원
+- 키보드 달력 탐색, 포커스 모달, 축소 창 상세 패널 등 접근성·반응형 UI
+
+자주 쓰는 단축키는 `Ctrl+F`(메시지 검색), `Ctrl+R`(새로고침), `Ctrl+N`(새 일정), `Ctrl+Shift+N`(새 쪽지)입니다.
 
 ## 기존 Python 버전에서 이전
 
@@ -74,5 +79,6 @@ Electron 설정과 동기화 상태는 `%APPDATA%\coolcalendar-electron`에 저�
 ```powershell
 cd electron_app
 npm run build
+npm test
 npm audit --omit=dev
 ```

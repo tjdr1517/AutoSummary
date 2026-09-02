@@ -1,16 +1,21 @@
 import Database from 'better-sqlite3'
 import iconv from 'iconv-lite'
 import { KISA_SEED_CBC } from 'kisa-seed'
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { Socket } from 'node:net'
+import { deflateSync } from 'node:zlib'
 import { powerMonitor } from 'electron'
 import type {
   ContactPresence,
   MarkReadResult,
   MessengerContact,
   MessengerDirectory,
-  MessengerGroup
+  MessengerGroup,
+  RecallMessageInput,
+  RecallMessageResult,
+  SendMessageInput,
+  SendMessageResult
 } from '../../shared/types'
 
 const CONNECT_REGISTRY = 'HKCU\\Software\\Jiransoft\\CoolMsg50\\Option\\Connect'
@@ -49,6 +54,40 @@ interface MemberRow {
   K_MemberID: number
   MemberID: string
   MemberName: string
+}
+
+interface PendingSend {
+  resolve: (memoId: number) => void
+  reject: (error: Error) => void
+  timer: NodeJS.Timeout
+}
+
+interface PendingRecall {
+  resolve: () => void
+  reject: (error: Error) => void
+  timer: NodeJS.Timeout
+}
+
+interface OutgoingRow {
+  MessageKey: number
+  MemoID: number
+  ReceiverKey: string
+  AnswerBack: string
+}
+
+interface IncomingReceipt {
+  memberKey: number
+  memberId: string
+  memberName: string
+  memoId: number
+  receivedAt: string
+}
+
+class DefiniteSendFailure extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DefiniteSendFailure'
+  }
 }
 
 interface DirectoryData {
@@ -102,6 +141,10 @@ function loadCredentials(): Credentials {
   }
 }
 
+export function coolMessengerOfficeId(): string {
+  return loadCredentials().officeId
+}
+
 function loadAwaySettings(): { enabled: boolean; idleSeconds: number } {
   try {
     const values = queryRegistry(AWAY_REGISTRY)
@@ -137,6 +180,10 @@ function uint32(value: number): Buffer {
 
 function wideString(value: string): Buffer {
   return Buffer.concat([Buffer.from(value, 'utf16le'), Buffer.alloc(2)])
+}
+
+function narrowString(value: string): Buffer {
+  return Buffer.concat([Buffer.from(value, 'ascii'), Buffer.alloc(1)])
 }
 
 function encryptedFrame(command: number, payload = Buffer.alloc(0)): Buffer {
@@ -186,6 +233,71 @@ function readMember(dbPath: string, memberKey: number): MemberRow {
   }
 }
 
+function readOutgoingRow(dbPath: string, messageKey: number): OutgoingRow {
+  const db = new Database(dbPath, { readonly: true, fileMustExist: true })
+  try {
+    const row = db.prepare(`
+      SELECT MessageKey, COALESCE(MemoID, 0) AS MemoID,
+        COALESCE(ReceiverKey, '') AS ReceiverKey,
+        COALESCE(AnswerBack, '') AS AnswerBack
+      FROM tbl_send WHERE MessageKey = ?
+    `).get(messageKey) as OutgoingRow | undefined
+    if (!row) throw new Error('회수할 보낸 쪽지를 찾을 수 없습니다.')
+    if (row.MemoID <= 0) throw new Error('서버 발송 번호가 없는 쪽지는 회수할 수 없습니다.')
+    if (parseAnswerBack(row.AnswerBack).length > 0) throw new Error('받는 사람이 이미 수신한 쪽지는 회수할 수 없습니다.')
+    return row
+  } finally {
+    db.close()
+  }
+}
+
+function outgoingReceiverKeys(value: string): number[] {
+  const values = String(value || '')
+    .split('|')
+    .map((item) => item.trim())
+    .filter((item) => /^\d+$/.test(item))
+    .map(Number)
+  const declaredCount = values[0] || 0
+  const keys = [...new Set(values.slice(1).filter((item) => item > 0))]
+  const result = declaredCount > 0 ? keys.slice(0, declaredCount) : keys
+  if (!result.length) throw new Error('회수할 쪽지의 받는 사람 정보를 확인할 수 없습니다.')
+  return result
+}
+
+function parseAnswerBack(value: string): Array<{ memberKey: number; receivedAt: string }> {
+  const parts = String(value || '').split('|').filter(Boolean)
+  const count = Math.max(0, Number(parts[0]) || 0)
+  const receipts: Array<{ memberKey: number; receivedAt: string }> = []
+  for (let index = 0; index < count; index += 1) {
+    const memberKey = Number(parts[1 + index * 2])
+    const receivedAt = String(parts[2 + index * 2] || '').trim()
+    if (Number.isInteger(memberKey) && memberKey > 0 && receivedAt) receipts.push({ memberKey, receivedAt })
+  }
+  return receipts
+}
+
+function saveOutgoingReceipt(dbPath: string, receipt: IncomingReceipt): boolean {
+  const db = new Database(dbPath, { fileMustExist: true })
+  try {
+    db.pragma('busy_timeout = 5000')
+    return db.transaction(() => {
+      const row = db.prepare(`
+        SELECT MessageKey, COALESCE(ReceiverKey, '') AS ReceiverKey,
+          COALESCE(AnswerBack, '') AS AnswerBack
+        FROM tbl_send WHERE MemoID = ? ORDER BY MessageKey DESC LIMIT 1
+      `).get(receipt.memoId) as { MessageKey: number; ReceiverKey: string; AnswerBack: string } | undefined
+      if (!row || !outgoingReceiverKeys(row.ReceiverKey).includes(receipt.memberKey)) return false
+      const receipts = parseAnswerBack(row.AnswerBack)
+      if (receipts.some((item) => item.memberKey === receipt.memberKey)) return false
+      receipts.push({ memberKey: receipt.memberKey, receivedAt: receipt.receivedAt })
+      const answerBack = `|${receipts.length}|${receipts.map((item) => `${item.memberKey}|${item.receivedAt}|`).join('')}`
+      return db.prepare('UPDATE tbl_send SET AnswerBack = ? WHERE MessageKey = ?').run(answerBack, row.MessageKey).changes > 0
+    })()
+  } finally {
+    db.close()
+  }
+}
+
 function setLocallyRead(dbPath: string, row: ReceiptRow): void {
   const db = new Database(dbPath, { fileMustExist: true })
   try {
@@ -194,6 +306,102 @@ function setLocallyRead(dbPath: string, row: ReceiptRow): void {
       UPDATE tbl_recv SET IsUnRead = 0
       WHERE MessageKey = ? AND MemoID = ? AND IsUnRead = ?
     `).run(row.MessageKey, row.MemoID, row.IsUnRead)
+  } finally {
+    db.close()
+  }
+}
+
+function escapeMessageHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/\r?\n/g, '<br>')
+}
+
+function compressedMessageBody(body: string): string {
+  const html = `<div style="line-height: 1.35;"><code>${escapeMessageHtml(body)}</code></div>`
+  return deflateSync(Buffer.from(html, 'utf16le')).toString('base64')
+}
+
+function outgoingDate(): string {
+  const now = new Date()
+  const weekday = '일월화수목금토'[now.getDay()]
+  return `${protocolDate(now)} (${weekday})`
+}
+
+function reserveOutgoingMessage(
+  dbPath: string,
+  recipients: MemberRow[],
+  title: string,
+  body: string,
+  compressedBody: string
+): number {
+  const db = new Database(dbPath, { fileMustExist: true })
+  try {
+    db.pragma('busy_timeout = 5000')
+    return db.transaction(() => {
+      const row = db.prepare('SELECT COALESCE(MAX(MessageKey), 0) + 1 AS MessageKey FROM tbl_send').get() as { MessageKey: number }
+      const messageKey = Number(row.MessageKey)
+      const receiverKey = `|${recipients.length}|${recipients.map((recipient) => recipient.K_MemberID).join('|')}|`
+      const receiverNames = recipients.map((recipient) => `${recipient.MemberName}(${recipient.MemberID});`).join(' ')
+      db.prepare(`
+        INSERT INTO tbl_send (
+          MessageKey, MessageBody, Title, Receiver, ReceiverKey, ReferenceList, CCList,
+          MessageType, SendDate, FilePath, FileHost, AnswerBack, CoolFile2SessionID,
+          ScheduledDate, MessageText, MemoID, IsChecked, IsMoved, LinkURL,
+          MessageCategory, DeletedDate
+        ) VALUES (?, ?, ?, ?, ?, ?, '|0|', 5, ?, '', '', '', '', '', ?, 0, 0, NULL, '', 0, NULL)
+      `).run(
+        messageKey,
+        `{COMP}${compressedBody}`,
+        title,
+        receiverNames,
+        receiverKey,
+        receiverKey,
+        outgoingDate(),
+        `\r\n${body}`
+      )
+      return messageKey
+    })()
+  } finally {
+    db.close()
+  }
+}
+
+function deleteReservedOutgoingMessage(dbPath: string, messageKey: number): boolean {
+  const db = new Database(dbPath, { fileMustExist: true })
+  try {
+    db.pragma('busy_timeout = 5000')
+    return db.prepare(`
+      DELETE FROM tbl_send
+      WHERE MessageKey = ? AND COALESCE(MemoID, 0) = 0
+    `).run(messageKey).changes > 0
+  } finally {
+    db.close()
+  }
+}
+
+function discardDefinitelyFailedOutgoing(dbPath: string, messageKey: number): void {
+  try {
+    if (!deleteReservedOutgoingMessage(dbPath, messageKey)) {
+      console.warn(`[CoolMessenger] 확정 실패한 발송 예약 행을 정리하지 못했습니다. messageKey=${messageKey}`)
+    }
+  } catch (error) {
+    console.warn(`[CoolMessenger] 확정 실패한 발송 예약 행 정리 중 오류가 발생했습니다. messageKey=${messageKey}`, error)
+  }
+}
+
+function setOutgoingMemoId(dbPath: string, messageKey: number, memoId: number): boolean {
+  const db = new Database(dbPath, { fileMustExist: true })
+  try {
+    db.pragma('busy_timeout = 5000')
+    const updated = db.prepare('UPDATE tbl_send SET MemoID = ? WHERE MessageKey = ? AND MemoID = 0').run(memoId, messageKey)
+    if (updated.changes > 0) return true
+    const row = db.prepare('SELECT COALESCE(MemoID, 0) AS MemoID FROM tbl_send WHERE MessageKey = ?').get(messageKey) as { MemoID: number } | undefined
+    return Number(row?.MemoID || 0) === memoId
   } finally {
     db.close()
   }
@@ -270,6 +478,33 @@ class BufferReader {
   private ensure(length: number): void {
     if (this.offset + length > this.buffer.length) throw new Error('주소록 데이터가 예상보다 짧습니다.')
   }
+}
+
+function parseIncomingReceipt(payload: Buffer): IncomingReceipt | undefined {
+  // The server may forward the original routing key or strip it before delivery.
+  for (const offset of [4, 0]) {
+    if (payload.length <= offset + 16) continue
+    try {
+      const reader = new BufferReader(payload.subarray(offset))
+      const memberKey = reader.u32()
+      const memberId = reader.wide().trim()
+      const memberName = reader.wide().trim()
+      const memoId = reader.i32()
+      const unreadValue = reader.wide().trim()
+      const receivedAt = reader.wide().trim()
+      if (
+        Number.isInteger(memberKey) && memberKey > 0 &&
+        memberId.length > 0 && memberId.length <= 200 &&
+        memberName.length > 0 && memberName.length <= 200 &&
+        Number.isInteger(memoId) && memoId > 0 &&
+        /^\d+$/.test(unreadValue) &&
+        /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}(?: \([A-Za-z]{3}\))?$/.test(receivedAt)
+      ) return { memberKey, memberId, memberName, memoId, receivedAt }
+    } catch {
+      // Try the alternate forwarded-payload layout.
+    }
+  }
+  return undefined
 }
 
 function parseDirectory(payload: Buffer): DirectoryData {
@@ -362,6 +597,10 @@ export class CoolMessengerSession {
   private directoryData: DirectoryData = { groups: [], contacts: [] }
   private statuses = new Map<number, number>()
   private directory: MessengerDirectory = { ...EMPTY_DIRECTORY }
+  private readonly pendingSends = new Map<number, PendingSend>()
+  private readonly pendingRecalls = new Map<number, PendingRecall>()
+  private readonly sendRequests = new Map<string, Promise<SendMessageResult>>()
+  private readonly recallRequests = new Map<string, Promise<RecallMessageResult>>()
   private readonly handleSuspend = (): void => {
     this.mainSocket?.destroy()
   }
@@ -379,7 +618,8 @@ export class CoolMessengerSession {
 
   constructor(
     private dbPath: string,
-    private readonly onUpdate: (directory: MessengerDirectory) => void
+    private readonly onUpdate: (directory: MessengerDirectory) => void,
+    private readonly onReceipt: () => void
   ) {}
 
   start(): void {
@@ -409,6 +649,7 @@ export class CoolMessengerSession {
     powerMonitor.off('unlock-screen', this.handleResume)
     powerMonitor.off('user-did-become-active', this.handleUserActive)
     this.mainSocket?.destroy()
+    this.rejectPendingSends(new Error('쿨메신저 연결이 종료되었습니다.'))
   }
 
   updateDbPath(dbPath: string): void {
@@ -447,6 +688,188 @@ export class CoolMessengerSession {
     })
     setLocallyRead(this.dbPath, row)
     return { marked: true, alreadyRead: false }
+  }
+
+  sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
+    const clientSendId = String(input.clientSendId || '').trim()
+    if (!/^[0-9a-z-]{8,128}$/i.test(clientSendId)) {
+      return Promise.reject(new Error('쪽지 발송 식별자가 올바르지 않습니다.'))
+    }
+    const existing = this.sendRequests.get(clientSendId)
+    if (existing) return existing
+    const request = this.performSendMessage(input)
+    this.sendRequests.set(clientSendId, request)
+    if (this.sendRequests.size > 100) {
+      const oldest = this.sendRequests.keys().next().value
+      if (oldest && oldest !== clientSendId) this.sendRequests.delete(oldest)
+    }
+    return request
+  }
+
+  recallMessage(input: RecallMessageInput): Promise<RecallMessageResult> {
+    const clientRecallId = String(input.clientRecallId || '').trim()
+    if (!/^[0-9a-z-]{8,128}$/i.test(clientRecallId)) {
+      return Promise.reject(new Error('쪽지 회수 식별자가 올바르지 않습니다.'))
+    }
+    const existing = this.recallRequests.get(clientRecallId)
+    if (existing) return existing
+    const request = this.performRecallMessage(input)
+    this.recallRequests.set(clientRecallId, request)
+    if (this.recallRequests.size > 100) {
+      const oldest = this.recallRequests.keys().next().value
+      if (oldest && oldest !== clientRecallId) this.recallRequests.delete(oldest)
+    }
+    return request
+  }
+
+  private async performRecallMessage(input: RecallMessageInput): Promise<RecallMessageResult> {
+    const messageKey = Number(input.messageKey)
+    if (!Number.isInteger(messageKey) || messageKey <= 0) throw new Error('회수할 쪽지 번호가 올바르지 않습니다.')
+    const row = readOutgoingRow(this.dbPath, messageKey)
+    await this.waitForLogin()
+    const socket = this.mainSocket
+    if (!socket || socket.destroyed) throw new Error('쿨메신저 서버에 연결되어 있지 않습니다.')
+    await this.sendRecall(socket, row.MemoID, outgoingReceiverKeys(row.ReceiverKey))
+    return { recalled: true, alreadyRecalled: false, memoId: row.MemoID, recalledAt: new Date().toISOString() }
+  }
+
+  private sendRecall(socket: Socket, memoId: number, recipientKeys: number[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const pending = this.pendingRecalls.get(memoId)
+        if (!pending) return
+        this.pendingRecalls.delete(memoId)
+        pending.reject(new Error('쿨메신저 서버에서 회수 결과를 확인하지 못했습니다. 로그인 연결을 새로 고친 뒤 다시 시도해 주세요.'))
+        if (this.mainSocket === socket) socket.destroy()
+      }, 12_000)
+      this.pendingRecalls.set(memoId, { resolve, reject, timer })
+      const payload = Buffer.concat([
+        int32(memoId),
+        int32(recipientKeys.length),
+        ...recipientKeys.map(int32)
+      ])
+      socket.write(encryptedFrame(106, payload), (error) => {
+        if (!error) return
+        const pending = this.pendingRecalls.get(memoId)
+        if (!pending) return
+        clearTimeout(pending.timer)
+        this.pendingRecalls.delete(memoId)
+        pending.reject(error)
+      })
+    })
+  }
+
+  private async performSendMessage(input: SendMessageInput): Promise<SendMessageResult> {
+    const recipientKeys = [...new Set(input.recipientKeys.map(Number))]
+    const title = String(input.title || '').trim()
+    const body = String(input.body || '').trim()
+    if (recipientKeys.length === 0 || recipientKeys.some((key) => !Number.isInteger(key) || key <= 0)) {
+      throw new Error('받는 사람을 한 명 이상 선택해 주세요.')
+    }
+    if (!title || title.length > 200) throw new Error('제목은 1자 이상 200자 이하로 입력해 주세요.')
+    if (!body || body.length > 20_000) throw new Error('본문은 1자 이상 20,000자 이하로 입력해 주세요.')
+    await this.waitForLogin()
+    const socket = this.mainSocket
+    if (!socket || socket.destroyed || !this.currentUserKey) throw new Error('쿨메신저 서버에 연결되어 있지 않습니다.')
+    if (recipientKeys.includes(this.currentUserKey)) {
+      throw new Error('본인에게 보내기는 쿨메신저의 5분 예약 발송 방식이 필요합니다. 현재는 다른 사람에게 보내기를 이용해 주세요.')
+    }
+    if (recipientKeys.length > 1) {
+      throw new Error('단체 쪽지 패킷 확인이 필요합니다. 현재는 한 명에게 보내기만 사용할 수 있습니다.')
+    }
+
+    const sender = readMember(this.dbPath, this.currentUserKey)
+    const recipients = recipientKeys.map((recipientKey) => readMember(this.dbPath, recipientKey))
+    const compressedBody = compressedMessageBody(body)
+    const messageKey = reserveOutgoingMessage(this.dbPath, recipients, title, body, compressedBody)
+    let payloads: Buffer[]
+    try {
+      payloads = recipientKeys.map((recipientKey) => Buffer.concat([
+        int32(recipientKey),
+        int32(this.currentUserKey),
+        wideString(sender.MemberID),
+        wideString(sender.MemberName),
+        randomBytes(4),
+        int32(0),
+        narrowString(compressedBody),
+        wideString(title),
+        wideString(`\r\n${body}`),
+        int32(0),
+        int32(messageKey),
+        int32(0),
+        int32(0),
+        int32(0)
+      ]))
+    } catch (error) {
+      discardDefinitelyFailedOutgoing(this.dbPath, messageKey)
+      throw error
+    }
+
+    let memoId: number
+    try {
+      memoId = await this.sendPacketAndWaitForAck(socket, messageKey, payloads)
+    } catch (error) {
+      if (error instanceof DefiniteSendFailure) discardDefinitelyFailedOutgoing(this.dbPath, messageKey)
+      throw error
+    }
+    try {
+      if (!setOutgoingMemoId(this.dbPath, messageKey, memoId)) {
+        console.warn(`[CoolMessenger] 서버 발송은 성공했지만 로컬 MemoID를 확인하지 못했습니다. messageKey=${messageKey}, memoId=${memoId}`)
+      }
+    } catch (error) {
+      console.warn(`[CoolMessenger] 서버 발송은 성공했지만 로컬 MemoID 저장에 실패했습니다. messageKey=${messageKey}, memoId=${memoId}`, error)
+    }
+    return { sent: true, memoId, recipientCount: recipientKeys.length, sentAt: new Date().toISOString() }
+  }
+
+  private sendPacketAndWaitForAck(socket: Socket, messageKey: number, payloads: Buffer[]): Promise<number> {
+    if (socket.destroyed || this.mainSocket !== socket) {
+      throw new DefiniteSendFailure('쪽지 패킷을 보내기 전에 쿨메신저 연결이 종료되었습니다.')
+    }
+    let frame: Buffer
+    try {
+      const plain = Buffer.concat([int32(8), int32(0), int32(payloads.length), int32(0), ...payloads])
+      const encrypted = seedEncrypt(plain)
+      frame = Buffer.concat([uint32(encrypted.length), encrypted])
+    } catch {
+      throw new DefiniteSendFailure('쪽지 패킷을 준비하지 못했습니다.')
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingSends.delete(messageKey)
+        reject(new Error('서버의 쪽지 발송 확인이 지연되고 있습니다. 중복 발송을 막기 위해 자동 재시도하지 않았습니다.'))
+      }, 12_000)
+      this.pendingSends.set(messageKey, { resolve, reject, timer })
+      try {
+        socket.write(frame, (error) => {
+          if (!error) return
+          const pending = this.pendingSends.get(messageKey)
+          if (!pending) return
+          clearTimeout(pending.timer)
+          this.pendingSends.delete(messageKey)
+          pending.reject(error)
+        })
+      } catch {
+        const pending = this.pendingSends.get(messageKey)
+        if (!pending) return
+        clearTimeout(pending.timer)
+        this.pendingSends.delete(messageKey)
+        pending.reject(new DefiniteSendFailure('쪽지 패킷을 서버에 전달하지 못했습니다.'))
+      }
+    })
+  }
+
+  private rejectPendingSends(error: Error): void {
+    for (const pending of this.pendingSends.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    }
+    this.pendingSends.clear()
+    for (const pending of this.pendingRecalls.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    }
+    this.pendingRecalls.clear()
   }
 
   private connectMain(): void {
@@ -527,6 +950,7 @@ export class CoolMessengerSession {
       this.currentUserKey = 0
       this.statusLoaded = false
       this.statuses.clear()
+      this.rejectPendingSends(new Error('쪽지를 보내는 중 쿨메신저 연결이 끊어졌습니다.'))
       this.publish()
       this.scheduleReconnect()
     })
@@ -536,6 +960,46 @@ export class CoolMessengerSession {
   private handleMainPacket(plain: Buffer, credentials: Credentials): void {
     const command = plain.readInt32BE(0)
     const payload = plain.subarray(16)
+    if (command === 11) {
+      const receipt = parseIncomingReceipt(payload)
+      if (receipt) {
+        try {
+          if (saveOutgoingReceipt(this.dbPath, receipt)) this.onReceipt()
+        } catch {
+          // The periodic refresh and a later server receipt remain available if the DB is briefly locked.
+        }
+      }
+      return
+    }
+    if (command === 107 && payload.length >= 8) {
+      const memoId = payload.readInt32BE(0)
+      const resultCode = payload.readInt32BE(4)
+      const pending = this.pendingRecalls.get(memoId)
+      if (pending) {
+        clearTimeout(pending.timer)
+        this.pendingRecalls.delete(memoId)
+        if (resultCode === 0) pending.resolve()
+        else if (resultCode === 3) {
+          pending.reject(new Error('상대방이 이미 읽은 쪽지라 회수할 수 없습니다. 쿨메신저는 읽지 않은 메시지만 회수할 수 있습니다.'))
+        } else {
+          pending.reject(new Error(`쿨메신저 서버가 쪽지 회수를 거절했습니다. (결과 코드 ${resultCode})`))
+        }
+      }
+      return
+    }
+    if (command === 149) return
+    if (command === 56 && payload.length >= 8) {
+      const messageKey = payload.readInt32BE(0)
+      const memoId = payload.readInt32BE(4)
+      const pending = this.pendingSends.get(messageKey)
+      if (pending) {
+        clearTimeout(pending.timer)
+        this.pendingSends.delete(messageKey)
+        if (memoId > 0) pending.resolve(memoId)
+        else pending.reject(new DefiniteSendFailure('쿨메신저 서버가 쪽지 발송을 거부했습니다.'))
+      }
+      return
+    }
     if (command === 3) {
       if (payload.length < 4 || payload.readInt32BE(0) <= 0) {
         this.setConnectionError(new Error('쿨메신저 서버 로그인이 거부되었습니다.'))

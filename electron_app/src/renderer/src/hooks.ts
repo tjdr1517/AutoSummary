@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { AppSnapshot } from '../../shared/types'
+import type { AppSnapshot, MessengerDirectory, OverlaySnapshot } from '../../shared/types'
 
 export function useAppSnapshot(): {
   snapshot: AppSnapshot | null
@@ -25,8 +25,27 @@ export function useAppSnapshot(): {
 
   useEffect(() => {
     void window.coolcalendar.getSnapshot().then(setSnapshot).catch((reason: unknown) => setError(String(reason))).finally(() => setLoading(false))
-    return window.coolcalendar.on('data-changed', (payload) => setSnapshot(payload as AppSnapshot))
+    const cleanups = [window.coolcalendar.on('data-changed', (payload) => {
+      setSnapshot(payload as AppSnapshot)
+      setError('')
+      setLoading(false)
+    })]
+    cleanups.push(window.coolcalendar.on('directory-changed', (payload) => {
+      setSnapshot((current) => current ? { ...current, directory: payload as MessengerDirectory } : current)
+    }))
+    return () => cleanups.forEach((cleanup) => cleanup())
   }, [])
 
   return { snapshot, loading, error, refresh }
+}
+
+export function useOverlaySnapshot(): OverlaySnapshot | null {
+  const [snapshot, setSnapshot] = useState<OverlaySnapshot | null>(null)
+
+  useEffect(() => {
+    void window.coolcalendar.getOverlaySnapshot().then(setSnapshot).catch(() => undefined)
+    return window.coolcalendar.on('calendar-changed', (payload) => setSnapshot(payload as OverlaySnapshot))
+  }, [])
+
+  return snapshot
 }

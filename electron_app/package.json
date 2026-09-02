@@ -7,9 +7,11 @@
   "main": "out/main/index.js",
   "type": "module",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "electron-vite dev --watch",
     "icon": "node scripts/build-icon.mjs",
     "build": "electron-vite build && tsc --noEmit",
+    "smoke": "electron . --smoke-test",
+    "test": "npm run build && npm run smoke",
     "preview": "electron-vite preview",
     "dist": "npm run build && electron-builder --win nsis",
     "postinstall": "electron-builder install-app-deps"
@@ -29,11 +31,11 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
-    "electron": "^39.8.6",
+    "electron": "^41.10.3",
     "electron-builder": "^26.0.12",
     "electron-vite": "^3.1.0",
     "png-to-ico": "^3.0.1",
-    "sharp": "^0.34.3",
+    "sharp": "^0.35.4",
     "typescript": "^5.8.3",
     "vite": "^6.3.5"
   },
